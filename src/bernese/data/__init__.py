@@ -24,8 +24,8 @@ from bernese.data import bed
 # Import HDF5 utilities
 from bernese.data import hdf5
 
-# Import akita data functions for convenience
-from bernese.data import akita
+# Import contacts (Hi-C) data functions
+from bernese.data import contacts
 
 # Import augmentation transforms
 from bernese.data import augment
@@ -49,6 +49,6 @@ __all__ = [
     "genomics",
     "bed",
     "hdf5",
-    "akita",
+    "contacts",
     "augment",
 ]

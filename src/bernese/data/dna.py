@@ -20,8 +20,6 @@ Functions:
     hot1_augment: Augment 1-hot sequences with shift and reverse complement.
 """
 
-from __future__ import annotations
-
 import random
 from typing import Optional
 

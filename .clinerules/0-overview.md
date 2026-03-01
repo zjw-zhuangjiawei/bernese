@@ -27,6 +27,7 @@ Bernese is a **PyTorch-based deep learning library for regulatory genomics predi
 | Document | Description |
 |----------|-------------|
 | [`1-uv-python-rules.md`](1-uv-python-rules.md) | UV Python package manager usage guide |
+| [`2-code-style-rules.md`](2-code-style-rules.md) | Code style guidelines |
 
 ---
 

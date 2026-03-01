@@ -7,8 +7,6 @@ for regulatory genomics predictions, migrated from the TensorFlow baskerville
 implementation.
 """
 
-from __future__ import annotations
-
 import math
 from typing import TYPE_CHECKING, Dict, List, Optional, Any, TypeVar
 

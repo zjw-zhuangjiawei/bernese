@@ -21,8 +21,6 @@ Functions:
     split_contigs: Split assembly by gaps
 """
 
-from __future__ import annotations
-
 import collections
 import gzip
 import heapq

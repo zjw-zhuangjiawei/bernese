@@ -2,8 +2,6 @@
 # Licensed under the Apache License, Version 2.0
 """Comprehensive training loop and utilities for SeqNN models."""
 
-from __future__ import annotations
-
 import json
 import math
 import os

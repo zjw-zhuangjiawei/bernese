@@ -6,13 +6,7 @@ This module provides TypedDict definitions for type-safe configuration handling
 across the Bernese project.
 """
 
-from __future__ import annotations
-
 from typing import TYPE_CHECKING, TypedDict, Literal
-
-# =============================================================================
-# Literal Types for Configuration Enums
-# =============================================================================
 
 # Activation functions
 ActivationType = Literal[
@@ -72,10 +66,6 @@ AUCCurve = Literal["ROC", "PR"]
 # Metric names
 MetricName = Literal["pearsonr", "r2", "auroc", "auprc", "val_loss"]
 
-# =============================================================================
-# Type Aliases (using TYPE_CHECKING for proper types)
-# =============================================================================
-
 if TYPE_CHECKING:
     import torch
     import numpy as np
@@ -103,11 +93,6 @@ else:
     DataLoader = "torch.utils.data.DataLoader"  # type: ignore[misc,assignment]
     NPArray = "numpy.ndarray"  # type: ignore[misc,assignment]
     TransformCallable = "Callable[[Tensor], Tensor]"  # type: ignore[misc,assignment]
-
-# =============================================================================
-# Block Configuration Types
-# =============================================================================
-
 
 class BlockConfig(TypedDict, total=False):
     """Configuration for a single neural network block.
@@ -252,11 +237,6 @@ class Symmetrize2dBlockConfig(BlockConfig):
     mode: str
 
 
-# =============================================================================
-# Model Configuration Types
-# =============================================================================
-
-
 class ModelConfig(TypedDict, total=False):
     """Configuration for SeqNN model.
 
@@ -293,11 +273,6 @@ class ModelConfig(TypedDict, total=False):
     model_strides: list[int]
     target_lengths: list[int]
     target_crops: list[int]
-
-
-# =============================================================================
-# Training Configuration Types
-# =============================================================================
 
 
 class TrainingConfig(TypedDict, total=False):
@@ -368,11 +343,6 @@ class TrainingConfig(TypedDict, total=False):
     seed: int
 
 
-# =============================================================================
-# Data Configuration Types
-# =============================================================================
-
-
 class DataConfig(TypedDict, total=False):
     """Configuration for data loading.
 
@@ -393,11 +363,6 @@ class DataConfig(TypedDict, total=False):
     pin_memory: bool
 
 
-# =============================================================================
-# Augmentation Configuration Types
-# =============================================================================
-
-
 class AugmentationConfig(TypedDict, total=False):
     """Configuration for data augmentation.
 
@@ -410,11 +375,6 @@ class AugmentationConfig(TypedDict, total=False):
     augment_rc: bool
     augment_shift: int | list[int]
     augment_rc_prob: float
-
-
-# =============================================================================
-# Validation Functions
-# =============================================================================
 
 
 def validate_model_config(config: dict[str, object]) -> ModelConfig:

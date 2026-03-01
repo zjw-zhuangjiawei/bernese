@@ -13,8 +13,6 @@ Functions:
     write_bedgraph: Write predictions as BEDgraph files
 """
 
-from __future__ import annotations
-
 import json
 import os
 from typing import Optional

@@ -4,7 +4,18 @@ version = "0.1.0"
 description = "Sequential regulatory activity predictions with deep convolutional neural networks (PyTorch)"
 readme = "README.md"
 requires-python = ">=3.13"
-dependencies = ["numpy", "pandas", "scipy", "h5py", "scikit-learn"]
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "h5py",
+    "scikit-learn",
+    "pysam>=0.23.3",
+    "cooltools>=0.7.1",
+    "intervaltree>=3.2.1",
+    "cooler>=0.10.4",
+    "astropy>=7.2.0",
+]
 
 [project.optional-dependencies]
 cu130 = ["torch>=2"]

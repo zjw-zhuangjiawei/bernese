@@ -2,8 +2,6 @@
 # Licensed under the Apache License, Version 2.0
 """PyTorch Dataset for genomic sequences with HDF5 support."""
 
-from __future__ import annotations
-
 import json
 import os
 from collections.abc import Callable

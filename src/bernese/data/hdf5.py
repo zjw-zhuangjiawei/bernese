@@ -11,8 +11,6 @@ Functions:
     collect_h5_borzoi: Collect Borzoi-style HDF5 output files
 """
 
-from __future__ import annotations
-
 import os
 from typing import Optional
 

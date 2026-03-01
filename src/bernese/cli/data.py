@@ -8,8 +8,6 @@ for training SeqNN models with Hi-C/coverage data.
 Based on the akita_data.py from Basenji.
 """
 
-from __future__ import annotations
-
 import argparse
 import json
 import os
@@ -21,7 +19,7 @@ from typing import Any, Optional
 
 import numpy as np
 
-from bernese.data import akita
+from bernese.data import contacts
 
 
 def create_parser() -> argparse.ArgumentParser:
@@ -315,26 +313,24 @@ def run_data_prep(options: dict[str, Any]) -> None:
     pool_width = options["pool_width"]
     diagonal_offset = options["diagonal_offset"]
 
-    # =========================================================================
-    # Define genomic contigs
-    # =========================================================================
     if not options["restart"]:
         print("Loading genome...")
-        chrom_contigs = akita.load_genome(fasta_file)
+        chrom_contigs = contacts.load_genome(fasta_file)
 
         # Remove gaps
         if options["gaps_file"]:
             print("Splitting at gaps...")
-            chrom_contigs = akita.split_contigs_by_gaps(chrom_contigs, options["gaps_file"])
+            from bernese.data import genomics
+            chrom_contigs = genomics.split_contigs_by_gaps(chrom_contigs, options["gaps_file"])
 
         # Convert to list
-        contigs = akita.contigs_to_list(chrom_contigs)
+        contigs = contacts.contigs_to_list(chrom_contigs)
         print(f"Loaded {len(contigs)} contigs")
 
         # Limit to BED file
         if options["limit_bed"] is not None:
             print("Limiting to BED regions...")
-            contigs = akita.limit_contigs_to_bed(contigs, options["limit_bed"])
+            contigs = contacts.limit_contigs_to_bed(contigs, options["limit_bed"])
 
         # Filter for large enough
         seq_tlength = seq_length - 2 * crop_bp
@@ -344,12 +340,9 @@ def run_data_prep(options: dict[str, Any]) -> None:
         # Break large contigs
         if options["break_threshold"] is not None:
             print(f"Breaking contigs > {options['break_threshold']} bp...")
-            contigs = akita.break_large_contigs(contigs, options["break_threshold"])
+            contigs = contacts.break_large_contigs(contigs, options["break_threshold"])
             print(f"Broken into {len(contigs)} contigs")
 
-    # =========================================================================
-    # Divide between train/valid/test
-    # =========================================================================
     # Set up fold labels
     if options["folds"] is not None:
         fold_labels = [f"fold{i}" for i in range(options["folds"])]
@@ -367,7 +360,7 @@ def run_data_prep(options: dict[str, Any]) -> None:
         valid_pct_or_chr = options["valid_pct_or_chr"]
 
         if options["folds"] is not None:
-            fold_contigs = akita.divide_contigs_by_folds(contigs, options["folds"])
+            fold_contigs = contacts.divide_contigs_by_folds(contigs, options["folds"])
         else:
             # Try to parse as float
             try:
@@ -377,7 +370,7 @@ def run_data_prep(options: dict[str, Any]) -> None:
                 if not (0 <= valid_pct <= 1 and 0 <= test_pct <= 1):
                     raise ValueError("Percentages must be between 0 and 1")
 
-                fold_contigs = akita.divide_contigs_by_pct(contigs, test_pct, valid_pct)
+                fold_contigs = contacts.divide_contigs_by_pct(contigs, test_pct, valid_pct)
             except (ValueError, TypeError):
                 # Parse as chromosome lists
                 valid_chrs = (
@@ -391,11 +384,11 @@ def run_data_prep(options: dict[str, Any]) -> None:
                     else test_pct_or_chr.split(",")
                 )
 
-                fold_contigs = akita.divide_contigs_by_chr(contigs, test_chrs, valid_chrs)
+                fold_contigs = contacts.divide_contigs_by_chr(contigs, test_chrs, valid_chrs)
 
         # Rejoin broken contigs within each fold
         for fi in range(len(fold_contigs)):
-            fold_contigs[fi] = akita.rejoin_broken_contigs(fold_contigs[fi])
+            fold_contigs[fi] = contacts.rejoin_broken_contigs(fold_contigs[fi])
 
         # Write contigs to BED
         ctg_bed_file = os.path.join(out_dir, "contigs.bed")
@@ -410,9 +403,6 @@ def run_data_prep(options: dict[str, Any]) -> None:
         print("Exiting after split (--split_test)")
         return
 
-    # =========================================================================
-    # Define model sequences
-    # =========================================================================
     if not options["restart"]:
         fold_mseqs = []
 
@@ -423,7 +413,7 @@ def run_data_prep(options: dict[str, Any]) -> None:
                 stride_fold = options["stride_train"]
 
             # Create sequences
-            mseqs = akita.create_model_sequences(
+            mseqs = contacts.create_model_sequences(
                 fold_contigs[fi],
                 seq_tlength,
                 stride_fold,
@@ -444,9 +434,6 @@ def run_data_prep(options: dict[str, Any]) -> None:
         # Merge into one list
         all_mseqs = [ms for fm in fold_mseqs for ms in fm]
 
-    # =========================================================================
-    # Mappability
-    # =========================================================================
     if not options["restart"]:
         # Check for bedtools if mappability is requested
         if options["umap_bed"] is not None or options["umap_midpoints"] is not None:
@@ -456,7 +443,7 @@ def run_data_prep(options: dict[str, Any]) -> None:
 
         if options["umap_bed"] is not None:
             print("Annotating mappability...")
-            seq_unmap = akita.annotate_mappability(
+            seq_unmap = contacts.annotate_mappability(
                 all_mseqs,
                 options["umap_bed"],
                 seq_length,
@@ -474,7 +461,7 @@ def run_data_prep(options: dict[str, Any]) -> None:
 
         if options["umap_midpoints"] is not None:
             print("Annotating midpoint mappability...")
-            seq_unmap_mid = akita.annotate_mappability(
+            seq_unmap_mid = contacts.annotate_mappability(
                 all_mseqs,
                 options["umap_midpoints"],
                 seq_length,
@@ -493,11 +480,11 @@ def run_data_prep(options: dict[str, Any]) -> None:
         # Write sequences to BED
         print("Writing sequences to BED...")
         seqs_bed_file = os.path.join(out_dir, "sequences.bed")
-        akita.write_sequences_bed(seqs_bed_file, all_mseqs, include_labels=True)
+        contacts.write_sequences_bed(seqs_bed_file, all_mseqs, include_labels=True)
     else:
         # Load from existing files
         seqs_bed_file = os.path.join(out_dir, "sequences.bed")
-        all_mseqs = akita.read_sequences_bed(seqs_bed_file)
+        all_mseqs = contacts.read_sequences_bed(seqs_bed_file)
 
         # Rebuild fold lists
         fold_mseqs = [[] for _ in range(num_folds)]
@@ -512,24 +499,18 @@ def run_data_prep(options: dict[str, Any]) -> None:
                 fold_idx = int(ms.label.replace("fold", ""))
                 fold_mseqs[fold_idx].append(ms)
 
-    # =========================================================================
-    # Copy targets file
-    # =========================================================================
     shutil.copy(targets_file, os.path.join(out_dir, "targets.txt"))
 
-    # =========================================================================
-    # Write statistics
-    # =========================================================================
     fold_seqs = {fold_labels[fi]: len(fold_mseqs[fi]) for fi in range(num_folds)}
 
-    stats = akita.compute_statistics(
+    stats = contacts.compute_hic_statistics(
         num_targets=1,  # Will be updated based on targets file
         seq_length=seq_length,
         pool_width=pool_width,
         crop_bp=crop_bp,
         diagonal_offset=diagonal_offset,
         fold_seqs=fold_seqs,
-    )
+    ).to_dict()
 
     # Update with actual target count
     import pandas as pd
