@@ -1,0 +1,32 @@
+[project]
+name = "bernese"
+version = "0.1.0"
+description = "Sequential regulatory activity predictions with deep convolutional neural networks (PyTorch)"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = ["numpy", "pandas", "scipy", "h5py", "scikit-learn"]
+
+[project.optional-dependencies]
+cu130 = ["torch>=2"]
+
+[project.scripts]
+bernese = "bernese.cli:main"
+
+[tool.uv]
+package = true
+
+[tool.uv.sources]
+torch = [
+    { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'", extra = "cu130" },
+]
+# torchvision = [
+#     { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'", extra = "cu130" },
+# ]
+
+[[tool.uv.index]]
+name = "pytorch-cu130"
+url = "https://download.pytorch.org/whl/cu130"
+explicit = true
+
+[tool.ruff]
+line-length = 100
