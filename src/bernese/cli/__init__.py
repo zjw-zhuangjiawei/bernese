@@ -1,33 +1,41 @@
-# CLI subpackage
-import sys
+# Copyright 2026
+# Licensed under the Apache License, Version 2.0
+"""Bernese CLI - Command-line interface for regulatory genomics predictions."""
+
+import typer
+
+from bernese.cli import data
+from bernese.cli import summary
+from bernese.cli import train
+
+app = typer.Typer(
+    help="Bernese - Sequential Neural Network for regulatory genomics predictions.",
+    add_completion=False,
+)
+
+# Register subcommands - both prepare and train are flattened to top level
+app.command(name="prepare")(data.prepare)
+app.command(name="summary")(summary.summary)
+app.command(name="train")(train.train)
 
 
-def main():
-    """Bernese CLI entry point."""
-    from bernese.cli import train as train_module
-    from bernese.cli import data as data_module
+@app.callback()
+def main() -> None:
+    """Bernese CLI.
 
-    if len(sys.argv) < 2:
-        print("Bernese CLI")
-        print("Usage: bernese <command> [options]")
-        print("")
-        print("Commands:")
-        print("  data    Prepare genomic data for training")
-        print("  train   Train a SeqNN model")
-        sys.exit(1)
+    A PyTorch-based library for regulatory genomics predictions using
+    Sequential Neural Networks (SeqNN).
 
-    command = sys.argv[1]
+    Commands:
+        prepare  Prepare genomic data for training
+        train    Train a SeqNN model
 
-    if command == "train":
-        sys.argv = sys.argv[1:]  # Remove 'train' from args
-        train_module.main()
-    elif command == "data":
-        sys.argv = sys.argv[1:]  # Remove 'data' from args
-        data_module.main()
-    else:
-        print(f"Unknown command: {command}")
-        print("Available commands: data, train")
-        sys.exit(1)
+    Example:
+        bernese prepare genome.fa targets.tsv -o data_out
+        bernese train params.json data_dir/
+    """
+    pass
 
 
-__all__ = ["main"]
+if __name__ == "__main__":
+    app()

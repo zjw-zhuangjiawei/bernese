@@ -785,6 +785,9 @@ def write_sequences_hdf5(
     seqs = seqs[start_idx:end_idx]
     num_seqs = len(seqs)
 
+    # Get DNA sequence length from first sequence
+    seq_len = seqs[0].end - seqs[0].start
+
     # Find target files
     seqs_cov_files = []
     ti = 0
@@ -799,12 +802,12 @@ def write_sequences_hdf5(
 
     # Get dimensions from first target file
     with h5py.File(seqs_cov_files[0], "r") as f:
-        seq_len_hic = f["targets"].shape[1]
+        target_len = f["targets"].shape[1]
         num_targets = len(seqs_cov_files)
 
-    # Initialize arrays
-    seqs_1hot = np.zeros((num_seqs, seq_len_hic, 4), dtype=np.float32)
-    targets = np.zeros((num_seqs, seq_len_hic, num_targets), dtype=np.float32)
+    # Initialize arrays - shape (num_seqs, 4, seq_len) for PyTorch
+    seqs_1hot = np.zeros((num_seqs, 4, seq_len), dtype=np.float32)
+    targets = np.zeros((num_seqs, target_len, num_targets), dtype=np.float32)
 
     # Open FASTA
     fasta = pysam.Fastafile(fasta_file)
@@ -814,8 +817,11 @@ def write_sequences_hdf5(
         # Read from FASTA
         seq_dna = fasta.fetch(seq.chr, seq.start, seq.end)
 
-        # One-hot encode
-        seq_1hot[si] = dna_1hot(seq_dna)
+        # One-hot encode - shape (seq_len, 4)
+        seq_1hot_encoded = dna_1hot(seq_dna)
+
+        # Transpose to (4, seq_len) for PyTorch channels-first
+        seqs_1hot[si] = seq_1hot_encoded.T
 
         # Read targets
         for ti, cov_file in enumerate(seqs_cov_files):
@@ -824,10 +830,10 @@ def write_sequences_hdf5(
 
     fasta.close()
 
-    # Write to HDF5
+    # Write to HDF5 (no compression)
     with h5py.File(output_h5, "w") as f:
-        f.create_dataset("seqs_1hot", data=seqs_1hot, compression="gzip")
-        f.create_dataset("targets", data=targets, compression="gzip")
+        f.create_dataset("seqs_1hot", data=seqs_1hot)
+        f.create_dataset("targets", data=targets)
 
 
 def dna_1hot(seq: str) -> np.ndarray:

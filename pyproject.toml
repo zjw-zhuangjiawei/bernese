@@ -15,13 +15,16 @@ dependencies = [
     "intervaltree>=3.2.1",
     "cooler>=0.10.4",
     "astropy>=7.2.0",
+    "typer>=0.24.1",
+    "einops>=0.8.2",
+    "torchinfo>=1.8.0",
 ]
 
 [project.optional-dependencies]
 cu130 = ["torch>=2"]
 
 [project.scripts]
-bernese = "bernese.cli:main"
+bernese = "bernese.cli:app"
 
 [tool.uv]
 package = true

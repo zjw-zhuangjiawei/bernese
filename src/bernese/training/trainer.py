@@ -6,8 +6,7 @@ import json
 import math
 import os
 import time
-from pathlib import Path
-from typing import TYPE_CHECKING, Optional, Dict, List, Any, Union
+from typing import Optional, Dict, List, Union
 
 import torch
 import torch.nn as nn
@@ -18,12 +17,6 @@ import numpy as np
 
 from bernese.metrics import losses as loss_functions
 from bernese.metrics import metrics as metric_functions
-from bernese.types import TrainingConfig, OptimizerType, LossType, DecayType, MetricName
-
-if TYPE_CHECKING:
-    from torch import Tensor
-else:
-    Tensor = "torch.Tensor"  # type: ignore[misc,assignment]
 
 
 class Trainer:
@@ -42,7 +35,7 @@ class Trainer:
         model: nn.Module,
         train_loader: Union[DataLoader, List[DataLoader]],
         val_loader: Union[DataLoader, List[DataLoader]],
-        config: TrainingConfig,
+        config: dict,
         device: str = "cuda" if torch.cuda.is_available() else "cpu",
     ):
         self.model = model.to(device)
@@ -86,7 +79,7 @@ class Trainer:
         self.clip_norm = config.get("clip_norm", None)
         self.global_clipnorm = config.get("global_clipnorm", None)
 
-    def _create_loss_function(self, config: TrainingConfig) -> nn.Module:
+    def _create_loss_function(self, config: dict) -> nn.Module:
         """Create loss function from config."""
         loss_name = str(config.get("loss", "mse")).lower()
 
@@ -101,7 +94,7 @@ class Trainer:
 
         return loss_functions.get_loss_function(loss_name, **loss_kwargs)
 
-    def _setup_metrics(self, config: TrainingConfig):
+    def _setup_metrics(self, config: dict):
         """Setup metrics for training and validation."""
         self.train_metrics: dict[str, nn.Module] = {}
         self.val_metrics: dict[str, nn.Module] = {}
@@ -119,7 +112,7 @@ class Trainer:
             self.val_metrics["pearsonr"] = metric_functions.PearsonR(num_targets, summarize=True)
             self.val_metrics["r2"] = metric_functions.R2(num_targets, summarize=True)
 
-    def _create_optimizer(self, config: TrainingConfig) -> torch.optim.Optimizer:
+    def _create_optimizer(self, config: dict) -> torch.optim.Optimizer:
         """Create optimizer from config."""
         optimizer_type = str(config.get("optimizer", "adam")).lower()
         lr = config.get("learning_rate", config.get("initial_learning_rate", 0.001))
@@ -151,7 +144,7 @@ class Trainer:
         else:
             raise ValueError(f"Unknown optimizer: {optimizer_type}")
 
-    def _create_scheduler(self, config: TrainingConfig) -> Optional[_LRScheduler]:
+    def _create_scheduler(self, config: dict) -> Optional[_LRScheduler]:
         """Create learning rate scheduler from config."""
         # Check for cyclical LR
         has_cyclical = (

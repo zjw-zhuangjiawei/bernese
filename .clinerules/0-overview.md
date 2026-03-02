@@ -4,7 +4,7 @@
 
 **Why**: These rules ensure consistent development practices, proper dependency management, and maintainable code across the Bernese project.
 
-Last updated: 2026-02-28
+Last updated: 2026-03-01
 
 ---
 
@@ -28,6 +28,7 @@ Bernese is a **PyTorch-based deep learning library for regulatory genomics predi
 |----------|-------------|
 | [`1-uv-python-rules.md`](1-uv-python-rules.md) | UV Python package manager usage guide |
 | [`2-code-style-rules.md`](2-code-style-rules.md) | Code style guidelines |
+| [`3-common-operations.md`](3-common-operations.md) | Common CLI operations reference |
 
 ---
 
@@ -37,9 +38,11 @@ Bernese is a **PyTorch-based deep learning library for regulatory genomics predi
 
 | Task | Command |
 |------|---------|
-| Install dependencies | `uv sync` |
+| Install dependencies (GPU) | `uv sync --extra cu130` |
+| Install dependencies (CPU) | `uv sync` |
 | Add dependency | `uv add <package>` |
-| Run CLI | `uv run bernese train <params_file> <data_dirs>...` |
+| Inspect model | `uv run bernese summary <params_file>` |
+| Train model | `uv run bernese train <params_file> <data_dirs>...` |
 | Run tests | `uv run pytest` |
 | Build package | `uv build` |
 

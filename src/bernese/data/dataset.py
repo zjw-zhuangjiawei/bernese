@@ -3,10 +3,9 @@
 """PyTorch Dataset for genomic sequences with HDF5 support."""
 
 import json
-import os
 from collections.abc import Callable
 from pathlib import Path
-from typing import TYPE_CHECKING, Any, Optional, Tuple, TypeVar
+from typing import Any, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -14,13 +13,8 @@ import pandas as pd
 import torch
 from torch.utils.data import DataLoader, Dataset, IterableDataset
 
-if TYPE_CHECKING:
-    from torch import Tensor
-else:
-    Tensor = "torch.Tensor"  # type: ignore[misc,assignment]
 
 # Type variable for transform functions
-T = TypeVar("T", bound=Tensor)
 
 
 class SeqDataset(Dataset):
@@ -34,6 +28,7 @@ class SeqDataset(Dataset):
         batch_size: Batch size for loading (used for batch count calculation)
         shuffle: Whether to shuffle the dataset (for training)
         seq_length_crop: Crop length from sequence ends
+        target_length_crop: Crop length from target ends (center crop)
         transform: Optional transform to apply to sequences
         target_transform: Optional transform to apply to targets
     """
@@ -45,6 +40,7 @@ class SeqDataset(Dataset):
         batch_size: int = 64,
         shuffle: bool = True,
         seq_length_crop: int = 0,
+        target_length_crop: int = 0,
         transform: Optional[Callable] = None,
         target_transform: Optional[Callable] = None,
     ):
@@ -53,6 +49,7 @@ class SeqDataset(Dataset):
         self.batch_size = batch_size
         self.shuffle = shuffle
         self.seq_length_crop = seq_length_crop
+        self.target_length_crop = target_length_crop
         self.transform = transform
         self.target_transform = target_transform
 
@@ -71,6 +68,11 @@ class SeqDataset(Dataset):
         self._actual_seq_length = self.seq_length
         if seq_length_crop > 0:
             self._actual_seq_length = self.seq_length - seq_length_crop
+
+        # Calculate actual target length after cropping
+        self._actual_target_length = self.target_length
+        if target_length_crop > 0:
+            self._actual_target_length = self.target_length - target_length_crop
 
         # Load sequence count
         self.num_seqs = stats.get(f"{split}_seqs", 0)
@@ -147,6 +149,11 @@ class SeqDataset(Dataset):
             targets = torch.from_numpy(self._targets[idx].copy())
         else:
             targets = torch.zeros(self.target_length, self.num_targets, dtype=torch.float32)
+
+        # Apply target length cropping (center crop)
+        if self.target_length_crop > 0 and targets.shape[0] > self._actual_target_length:
+            crop_len = self.target_length_crop // 2
+            targets = targets[crop_len:-crop_len, :]
 
         # Apply transforms
         if self.transform is not None:
@@ -287,6 +294,7 @@ def create_data_loaders(
     num_workers: int = 0,
     shuffle_train: bool = True,
     seq_length_crop: int = 0,
+    target_length_crop: int = 0,
     pin_memory: bool = True,
 ) -> Tuple[DataLoader, DataLoader, Optional[DataLoader]]:
     """Create train, validation, and test data loaders.
@@ -297,6 +305,7 @@ def create_data_loaders(
         num_workers: Number of worker processes for data loading
         shuffle_train: Whether to shuffle training data
         seq_length_crop: Crop length from sequence ends
+        target_length_crop: Crop length from target ends (center crop)
         pin_memory: Whether to pin memory for faster GPU transfer
 
     Returns:
@@ -314,6 +323,7 @@ def create_data_loaders(
         batch_size=batch_size,
         shuffle=shuffle_train,
         seq_length_crop=seq_length_crop,
+        target_length_crop=target_length_crop,
     )
     val_dataset = SeqDataset(
         data_dir,
@@ -321,6 +331,7 @@ def create_data_loaders(
         batch_size=batch_size,
         shuffle=False,
         seq_length_crop=seq_length_crop,
+        target_length_crop=target_length_crop,
     )
 
     # Check if test split exists
@@ -332,6 +343,7 @@ def create_data_loaders(
             batch_size=batch_size,
             shuffle=False,
             seq_length_crop=seq_length_crop,
+            target_length_crop=target_length_crop,
         )
 
     # Create data loaders

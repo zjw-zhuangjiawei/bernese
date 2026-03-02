@@ -442,6 +442,9 @@ def break_large_contigs(
         ctg_len = ctg.end - ctg.start
         heapq.heappush(contig_heap, (-ctg_len, ctg))
 
+    # Collect contigs that don't exceed the threshold
+    result_contigs = []
+
     while contig_heap:
         # Pop largest contig
         ctg_neg_len, ctg = heapq.heappop(contig_heap)
@@ -456,12 +459,14 @@ def break_large_contigs(
             ctg_left = Contig(ctg.genome, ctg.chr, ctg.start, ctg_mid)
             ctg_right = Contig(ctg.genome, ctg.chr, ctg_mid, ctg.end)
 
-            # Add both halves back
+            # Add both halves back to heap
             heapq.heappush(contig_heap, (-(ctg_left.end - ctg_left.start), ctg_left))
             heapq.heappush(contig_heap, (-(ctg_right.end - ctg_right.start), ctg_right))
+        else:
+            # Contig is small enough, keep it
+            result_contigs.append(ctg)
 
-    # Convert back to list
-    return [ctg for _, ctg in contig_heap]
+    return result_contigs
 
 
 def rejoin_broken_contigs(contigs: list[Contig]) -> list[Contig]:
@@ -626,5 +631,5 @@ def read_sequences_bed(bed_file: str) -> list[ModelSeq]:
             start = int(parts[1])
             end = int(parts[2])
             label = parts[3] if len(parts) > 3 else None
-            seqs.append(ModelSeq(genome="", chrom=chrom, start=start, end=end, label=label))
+            seqs.append(ModelSeq(genome="", chr=chrom, start=start, end=end, label=label))
     return seqs
