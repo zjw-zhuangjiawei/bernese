@@ -3,14 +3,14 @@
 """Summary command-line interface for bernese.
 
 This module provides the 'bernese summary' command for visualizing
-SeqNN model architecture using torchinfo.
+SeqNN model architecture.
 """
 
 from pathlib import Path
 from typing import Optional
 
+import keras
 import torch
-import torchinfo
 import typer
 
 from bernese.models import create_seqnn
@@ -30,15 +30,12 @@ def summary(
     device: str = typer.Option(
         "cuda" if torch.cuda.is_available() else "cpu", "-d", "--device", help="Device for model"
     ),
-    verbose: int = typer.Option(1, "-v", "--verbose", help="Verbosity level for torchinfo (0-3)"),
-    row_settings: Optional[list[str]] = typer.Option(
-        None, "--row_settings", help="Row settings for torchinfo (e.g., aliases,depth)"
-    ),
+    verbose: int = typer.Option(1, "-v", "--verbose", help="Verbosity level (0-2)"),
 ) -> None:
     """Display a summary of the SeqNN model architecture.
 
     Loads model configuration from a JSON file and displays a detailed
-    architecture summary using torchinfo.
+    architecture summary.
 
     Example:
         bernese summary params.json
@@ -67,48 +64,35 @@ def summary(
     if "num_targets" not in params_model:
         params_model["num_targets"] = 1
 
+    # Set verbose for model building
+    params_model["verbose"] = verbose > 0
+
     # Create model
     print(f"Loading model from: {params_file}")
+    print(f"Keras backend: {keras.backend.backend()}")
     print(f"Device: {device}")
     print("-" * 60)
 
+    # Create model
     model = create_seqnn(params_model)
-    model = model.to(device)
 
-    # Get input size - SeqNN expects (batch, seq_length, seq_depth)
-    batch_size = 1
+    # Get model info
     seq_len = params_model.get("seq_length", 1344)
     seq_depth_val = params_model.get("seq_depth", 4)
-
-    # Use torchinfo's detailed_print for better output with custom input
-    # The model expects (batch, seq_length, channels) format
-    input_size = (batch_size, seq_len, seq_depth_val)
-
-    # Prepare torchinfo kwargs - use col_names for detailed output
-    torchinfo_kwargs = {
-        "model": model,
-        "input_size": input_size,
-        "device": device,
-        "verbose": verbose,
-        "col_names": ["input_size", "output_size", "num_params", "trainable"],
-        "col_width": 35,
-    }
-
-    if row_settings:
-        torchinfo_kwargs["row_settings"] = row_settings
+    num_targets_val = model.get_num_targets()
 
     # Print summary
-    torchinfo.summary(**torchinfo_kwargs)
-
-    # Print additional info
     print("-" * 60)
     print(f"Model configuration:")
     print(f"  Sequence length: {seq_len}")
     print(f"  Sequence depth: {seq_depth_val}")
-    print(f"  Number of targets: {params_model['num_targets']}")
+    print(f"  Number of targets: {num_targets_val}")
 
     # Print total parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    total_params = model.model.count_params()
     print(f"\nTotal parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
+
+    if verbose > 1:
+        print("-" * 60)
+        print("Layer summary:")
+        print(model.model.summary(line_length=100))

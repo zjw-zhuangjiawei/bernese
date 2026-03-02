@@ -1,24 +1,25 @@
 # Bernese Clinerules Overview
 
-**Summary**: Project-specific rules and guidelines for developing Bernese, a PyTorch-based library for regulatory genomics predictions.
+**Summary**: Project-specific rules and guidelines for developing Bernese, a Keras 3-based library for regulatory genomics predictions.
 
 **Why**: These rules ensure consistent development practices, proper dependency management, and maintainable code across the Bernese project.
 
-Last updated: 2026-03-01
+Last updated: 2026-03-02
 
 ---
 
 ## Project Overview
 
-Bernese is a **PyTorch-based deep learning library for regulatory genomics predictions**. It implements the SeqNN (Sequence Neural Network) model for predicting regulatory activity from DNA sequences.
+Bernese is a **Keras 3-based deep learning library for regulatory genomics predictions**. It implements the SeqNN (Sequence Neural Network) model for predicting regulatory activity from DNA sequences.
 
 | Aspect | Details |
 |--------|---------|
 | **Type** | Python library for genomic/molecular biology deep learning |
+| **Framework** | Keras 3 (with optional PyTorch/CUDA support) |
 | **Core Model** | SeqNN - Sequential Neural Network for regulatory activity prediction |
 | **Data Format** | HDF5 files (sequences.h5) with JSON metadata (statistics.json) |
 | **Python** | >=3.13 |
-| **Key Dependencies** | numpy, pandas, scipy, h5py, scikit-learn, torch |
+| **Key Dependencies** | numpy, pandas, scipy, h5py, scikit-learn, keras, torchinfo |
 
 ---
 
@@ -67,9 +68,15 @@ bernese/
 
 ### Models
 
-- **`SeqNN`**: Main model class for regulatory activity prediction
+- **`SeqNN`**: Main model class for regulatory activity prediction (Keras 3)
   - Location: `src/bernese/models/seqnn.py`
-  - Configuration: Dictionary-based params (see `DEFAULT_CONFIG`)
+  - Factory function: `create_seqnn()`
+
+- **`layers`**: Keras 3 layer definitions
+  - Location: `src/bernese/models/layers.py`
+
+- **`blocks`**: Keras 3 model blocks (convolution, dense, towers)
+  - Location: `src/bernese/models/blocks.py`
 
 ### Data
 
