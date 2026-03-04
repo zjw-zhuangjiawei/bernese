@@ -32,25 +32,42 @@ def set_seed(seed: int):
 
 
 def train(
-    params_file: Path = typer.Argument(..., exists=True, help="JSON file with model and training parameters"),
+    model_file: Path = typer.Argument(..., exists=True, help="Path to model.json"),
+    train_file: Path = typer.Argument(..., exists=True, help="Path to train.json"),
     data_dirs: List[Path] = typer.Argument(..., help="Training data directory(ies)"),
     out_dir: Path = typer.Option("train_out", "-o", help="Output directory for checkpoints"),
-    epochs: Optional[int] = typer.Option(None, "--epochs", help="Number of training epochs (default: from config)"),
-    batch_size: Optional[int] = typer.Option(None, "--batch_size", help="Batch size (default: from config)"),
-    lr: Optional[float] = typer.Option(None, "--lr", "--learning_rate", help="Learning rate (default: from config)"),
-    optimizer: Optional[str] = typer.Option(None, "--optimizer", help="Optimizer type: adam, adamw, or sgd (default: from config)"),
-    loss: Optional[str] = typer.Option(None, "--loss", help="Loss function: mse, bce, poisson, poisson_kl, poisson_multinomial, or mse_udot (default: from config)"),
-    device: str = typer.Option("cuda" if torch.cuda.is_available() else "cpu", "-d", "--device", help="Device to train on"),
+    epochs: Optional[int] = typer.Option(
+        None, "--epochs", help="Number of training epochs (default: from config)"
+    ),
+    batch_size: Optional[int] = typer.Option(
+        None, "--batch_size", help="Batch size (default: from config)"
+    ),
+    lr: Optional[float] = typer.Option(
+        None, "--lr", "--learning_rate", help="Learning rate (default: from config)"
+    ),
+    optimizer: Optional[str] = typer.Option(
+        None, "--optimizer", help="Optimizer type: adam, adamw, or sgd (default: from config)"
+    ),
+    loss: Optional[str] = typer.Option(
+        None,
+        "--loss",
+        help="Loss function: mse, bce, poisson, poisson_kl, poisson_multinomial, or mse_udot (default: from config)",
+    ),
+    device: str = typer.Option(
+        "cuda" if torch.cuda.is_available() else "cpu", "-d", "--device", help="Device to train on"
+    ),
     num_workers: int = typer.Option(0, "--num_workers", help="Number of data loading workers"),
     resume: Optional[Path] = typer.Option(None, "--resume", help="Resume from checkpoint"),
     seed: int = typer.Option(42, "--seed", help="Random seed for reproducibility"),
-    copy_params: bool = typer.Option(False, "--copy_params", help="Copy params file to output directory"),
+    copy_params: bool = typer.Option(
+        False, "--copy_params", help="Copy params file to output directory"
+    ),
 ) -> None:
     """Train a SeqNN model for regulatory genomics predictions.
 
     Example:
-        bernese train params.json data_dir/ -o train_out
-        bernese train params.json data_dir/ --epochs 100 --lr 0.001
+        bernese train model.json train.json data_dir/ -o train_out
+        bernese train model.json train.json data_dir/ --epochs 100 --lr 0.001
     """
     # Set random seed
     set_seed(seed)
@@ -58,16 +75,18 @@ def train(
     # Create output directory
     os.makedirs(out_dir, exist_ok=True)
 
-    # Copy params file
-    if copy_params and params_file != Path(out_dir) / "params.json":
-        shutil.copy(params_file, Path(out_dir) / "params.json")
+    # Copy config files
+    if copy_params:
+        shutil.copy(model_file, Path(out_dir) / "model.json")
+        shutil.copy(train_file, Path(out_dir) / "train.json")
 
-    # Load configuration
-    with open(params_file, "r") as f:
-        params = json.load(f)
+    # Load model configuration
+    with open(model_file, "r") as f:
+        params_model = json.load(f)
 
-    params_model = params.get("model", {})
-    params_train = params.get("train", {})
+    # Load training configuration
+    with open(train_file, "r") as f:
+        params_train = json.load(f)
 
     # Override config with command-line args
     if batch_size is not None:
@@ -112,12 +131,6 @@ def train(
     # Create model
     print("Creating model...")
     model = create_seqnn(params_model)
-
-    # Print model summary
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    print(f"Total parameters: {total_params:,}")
-    print(f"Trainable parameters: {trainable_params:,}")
 
     # Create trainer
     print("Creating trainer...")

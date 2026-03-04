@@ -4,7 +4,7 @@
 
 **Why**: This document provides quick command references for everyday development tasks.
 
-Last updated: 2026-03-02
+Last updated: 2026-03-04
 
 ---
 
@@ -27,8 +27,10 @@ Last updated: 2026-03-02
 | Task | Command |
 |------|---------|
 | Inspect model architecture | `uv run bernese summary <params_file>` |
-| Train model | `uv run bernese train <params_file> <data_dirs>...` |
-| Prepare genomic data | `uv run bernese prepare <genome> <targets> -o <output_dir>` |
+| Inspect dataset | `uv run bernese inspect <data_dir>` |
+| Train model | `uv run bernese train <model_file> <data_dirs>...` |
+| Prepare genomic data (Hi-C) | `uv run bernese prepare hic <genome> <targets> -o <output_dir>` |
+| Prepare genomic data (bigWig) | `uv run bernese prepare bigwig <genome> <targets> -o <output_dir>` |
 | Run tests | `uv run pytest` |
 | Build package | `uv build` |
 

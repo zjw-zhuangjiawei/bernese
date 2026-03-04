@@ -1,54 +1,74 @@
 # Data subpackage
+
+# Import dataset
 from bernese.data.dataset import (
-    SeqDataset,
-    SeqDatasetLazy,
+    GenomicDataset,
+    DatasetWriter,
+    create_data_loaders_v2,
     create_data_loaders,
-    load_targets_info,
-    create_collate_fn,
-    untransform_preds,
-    untransform_preds1,
-    untransform_preds_torch,
-    make_strand_transform,
-    targets_prep_strand,
+    MultiDatasetWrapper,
 )
 
-# Import DNA utilities
-from bernese.data import dna
+# Import backends
+from bernese.data.backends import (
+    DataBackend,
+    DatasetMetadata,
+    SplitMetadata,
+    HDF5Backend,
+)
 
-# Import genomic data structures
-from bernese.data import genomics
+# Import transforms
+from bernese.data.transforms import (
+    Transform,
+    TransformPipeline,
+    RandomShift,
+    ReverseComplement,
+    RandomCrop,
+    TargetNormalize,
+)
 
-# Import BED file utilities
-from bernese.data import bed
+# Import target processors
+from bernese.data.targets import (
+    TargetProcessorRegistry,
+    target_processor,
+    HiCTargetProcessor,
+    BigWigTargetProcessor,
+)
 
-# Import HDF5 utilities
-from bernese.data import hdf5
+# Import preparation
+from bernese.data.preparation import (
+    DataPreparator,
+    PreparationConfig,
+    prepare_dataset,
+)
 
-# Import contacts (Hi-C) data functions
-from bernese.data import contacts
-
-# Import augmentation transforms
-from bernese.data import augment
 
 __all__ = [
-    # Dataset classes
-    "SeqDataset",
-    "SeqDatasetLazy",
-    # Dataset utilities
+    # Dataset
+    "GenomicDataset",
+    "DatasetWriter",
+    "create_data_loaders_v2",
     "create_data_loaders",
-    "load_targets_info",
-    "create_collate_fn",
-    # Target transformations
-    "untransform_preds",
-    "untransform_preds1",
-    "untransform_preds_torch",
-    "make_strand_transform",
-    "targets_prep_strand",
-    # Submodules
-    "dna",
-    "genomics",
-    "bed",
-    "hdf5",
-    "contacts",
-    "augment",
+    "MultiDatasetWrapper",
+    # Backends
+    "DataBackend",
+    "DatasetMetadata",
+    "SplitMetadata",
+    "HDF5Backend",
+    # Transforms
+    "Transform",
+    "TransformPipeline",
+    "RandomShift",
+    "ReverseComplement",
+    "RandomCrop",
+    "TargetNormalize",
+    # Target processors
+    "TargetProcessorRegistry",
+    "target_processor",
+    "HiCTargetProcessor",
+    "BigWigTargetProcessor",
+    # Preparation
+    "DataPreparator",
+    "PreparationConfig",
+    "prepare_dataset",
 ]

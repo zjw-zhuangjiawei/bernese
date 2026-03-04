@@ -378,10 +378,12 @@ class StochasticShift(keras.layers.Layer):
         # Random shift
         if self.symmetric:
             shift = keras.random.uniform(
-                (), minval=-self.shift_max, maxval=self.shift_max + 1, dtype="int32"
+                (), minval=-self.shift_max, maxval=self.shift_max + 1
             )
+            shift = ops.cast(shift, "int32")
         else:
-            shift = keras.random.uniform((), minval=0, maxval=self.shift_max + 1, dtype="int32")
+            shift = keras.random.uniform((), minval=0, maxval=self.shift_max + 1)
+            shift = ops.cast(shift, "int32")
 
         # Apply shift
         seq_len = ops.shape(seq_1hot)[1]
@@ -390,6 +392,11 @@ class StochasticShift(keras.layers.Layer):
         # Negative shift = shift left (pad on right)
         if_shift = shift > 0
         shift_abs = ops.abs(shift)
+
+        # Handle edge case where shift is 0 - return original sequence
+        # When shift_abs is 0, slicing with :-0 or [0:] causes issues
+        if ops.equal(shift_abs, 0):
+            return seq_1hot
 
         # Create padded tensor
         pad_left = ops.zeros((ops.shape(seq_1hot)[0], shift_abs, 4))

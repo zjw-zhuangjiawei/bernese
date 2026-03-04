@@ -4,7 +4,7 @@
 
 **Why**: These rules ensure consistent development practices, proper dependency management, and maintainable code across the Bernese project.
 
-Last updated: 2026-03-02
+Last updated: 2026-03-04
 
 ---
 
@@ -53,12 +53,19 @@ Bernese is a **Keras 3-based deep learning library for regulatory genomics predi
 bernese/
 ├── .clinerules/           # This directory
 ├── src/bernese/           # Package source code
-│   ├── cli/               # CLI entry points
+│   ├── cli/               # CLI entry points (train, summary, inspect, prepare)
 │   ├── data/              # Dataset classes
-│   ├── interpretation/    # Interpretation tools
+│   │   ├── backends/      # Data backend implementations (HDF5, base)
+│   │   ├── targets/        # Target loaders (bigWig, Hi-C, registry)
+│   │   ├── transforms/     # Data transformations (sequence, target)
+│   │   ├── dataset.py      # PyTorch Dataset for genomic sequences
+│   │   └── preparation.py  # Data preparation utilities
+│   ├── interpretation/    # Interpretation tools (SHAP, importance scores)
 │   ├── metrics/           # Loss functions and metrics
-│   ├── models/            # Model architectures
-│   └── training/          # Training utilities
+│   │   ├── losses.py       # Loss functions (MSE, Poisson KL, BCE)
+│   │   └── metrics.py      # Evaluation metrics (PearsonR, R2, AUROC, AUPRC)
+│   ├── models/            # Model architectures (SeqNN, layers, blocks)
+│   └── training/          # Training utilities (Trainer)
 └── tests/                 # Test files
 ```
 

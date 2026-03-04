@@ -1,9 +1,0 @@
-{
-  "batch_size": 2,
-  "optimizer": "sgd",
-  "learning_rate": 0.0005,
-  "momentum": 0.99575,
-  "loss": "mse",
-  "patience": 20,
-  "clip_norm": 10.0
-}

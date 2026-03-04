@@ -1,0 +1,523 @@
+# Copyright 2026
+# Licensed under the Apache License, Version 2.0
+"""Data preparation utilities for creating v2 datasets.
+
+This module provides functions for preparing genomic data in the v2 format
+with manifest.json and split-based organization.
+"""
+
+from __future__ import annotations
+
+from collections import namedtuple
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+import numpy as np
+import pandas as pd
+import pysam
+
+from bernese.data.dataset import DatasetWriter
+from bernese.data.targets import TargetProcessorRegistry
+
+
+# Basenji-style namedtuples
+Contig = namedtuple("Contig", ["chr", "start", "end"])
+GenomicRegion = namedtuple("GenomicRegion", ["chrom", "start", "end", "label"])
+
+
+@dataclass
+class PreparationConfig:
+    """Configuration for data preparation."""
+
+    # Sequence parameters
+    seq_length: int = 131072
+    crop_bp: int = 0
+    pool_width: int = 128
+
+    # Target parameters
+    target_type: str = "hic"
+    diagonal_offset: int = 2
+
+    # Split parameters
+    test_pct: float = 0.05
+    valid_pct: float = 0.05
+    folds: Optional[int] = None
+
+    # Block-based region creation
+    block_size: int = 1048576  # 1 Mb
+    join_blocks: bool = True    # Join adjacent blocks after splitting
+
+    # Stride parameters
+    stride_train: float = 1.0
+    stride_test: float = 1.0
+    snap: int = 1
+
+    # Filtering
+    sample_pct: float = 1.0
+
+    # Random
+    seed: int = 44
+
+
+class DataPreparator:
+    """Prepares genomic data in v2 format.
+
+    This class handles the complete data preparation pipeline:
+    1. Pre-encode entire genome to 1hot (genome.h5)
+    2. Create sequence coordinates and write indices
+    3. Split into train/valid/test using basenji algorithm
+    4. Extract targets using target processors
+    5. Write manifest and HDF5 files using DatasetWriter
+    """
+
+    def __init__(
+        self,
+        output_dir: str | Path,
+        fasta_file: str | Path,
+        targets_file: str | Path,
+        config: Optional[PreparationConfig] = None,
+    ):
+        self.output_dir = Path(output_dir)
+        self.fasta_file = Path(fasta_file)
+        self.targets_file = Path(targets_file)
+        self.config = config or PreparationConfig()
+
+        # Load targets info
+        self.targets_df = pd.read_csv(targets_file, sep="\t", index_col=0)
+
+        # Calculate target length
+        self.target_length = self._calculate_target_length()
+
+        # Create writer
+        self.writer = DatasetWriter(
+            output_dir=self.output_dir,
+            seq_length=self.config.seq_length,
+            seq_depth=4,
+            target_length=self.target_length,
+            num_targets=len(self.targets_df),
+        )
+
+        # Setup random
+        np.random.seed(self.config.seed)
+
+        # Track chromsome mapping (name -> index)
+        self._chrom_to_idx: dict[str, int] = {}
+
+    def _calculate_target_length(self) -> int:
+        """Calculate target length based on target type."""
+        seq_length = self.config.seq_length - 2 * self.config.crop_bp
+        pool_length = seq_length // self.config.pool_width
+        seq_len_nodiag = pool_length - self.config.diagonal_offset
+        return seq_len_nodiag * (seq_len_nodiag + 1) // 2
+
+    def prepare(self):
+        """Run complete data preparation.
+
+        Returns:
+            DatasetMetadata for the prepared dataset
+        """
+        # Step 1: Pre-encode entire genome to 1hot
+        print("Pre-encoding genome...")
+        self._preencode_genome()
+
+        # Step 2: Load genome and create sequence coordinates
+        print("Creating sequence regions...")
+        regions_by_split = self._create_sequence_regions()
+
+        # Step 3: Write indices using DatasetWriter
+        print("Writing indices...")
+        self._write_indices(regions_by_split)
+
+        # Step 4: Extract targets using target processors
+        print("Extracting targets...")
+        self._extract_targets(regions_by_split)
+
+        # Step 5: Finalize (creates manifest.json)
+        print("Creating manifest...")
+        target_info = []
+        for ti, row in self.targets_df.iterrows():
+            target_info.append({
+                "name": row.get("name", f"target_{ti}"),
+                "clip": row.get("clip"),
+            })
+
+        metadata = self.writer.finalize(
+            genome_name=self.fasta_file.stem,
+            target_type=self.config.target_type,
+            pool_width=self.config.pool_width,
+            diagonal_offset=self.config.diagonal_offset,
+            target_info=target_info,
+        )
+
+        print(f"Data preparation complete: {self.output_dir}")
+        return metadata
+
+    def _preencode_genome(self) -> None:
+        """Pre-encode entire genome to 1hot and save to genome.h5."""
+        # Open FASTA file
+        fasta = pysam.FastaFile(str(self.fasta_file))
+
+        try:
+            genome_dict = {}
+
+            # Build chromosome mapping using names (not indices)
+            for chrom, length in zip(fasta.references, fasta.lengths):
+                print(f"  Encoding {chrom} ({length} bp)")
+
+                # Fetch sequence
+                seq_dna = fasta.fetch(chrom)
+
+                # One-hot encode
+                seq_1hot = self._dna_1hot_full(seq_dna)
+                # Use chromosome name as key (e.g., "chr1", "chr2")
+                genome_dict[chrom] = seq_1hot
+
+            # Write to genome.h5
+            self.writer.write_genome(genome_dict)
+
+        finally:
+            fasta.close()
+
+    def _write_indices(self, regions_by_split: dict[str, list[GenomicRegion]]) -> None:
+        """Write sequence indices for each split."""
+        for split, regions in regions_by_split.items():
+            if len(regions) == 0:
+                continue
+
+            chrom_names = []
+            starts = []
+            ends = []
+
+            for region in regions:
+                # Use chromosome name directly
+                chrom_names.append(region.chrom)
+                starts.append(region.start)
+                ends.append(region.end)
+
+            self.writer.write_indices(split, chrom_names, starts, ends)
+
+    def _dna_1hot_full(self, seq: str) -> np.ndarray:
+        """One-hot encode full DNA sequence (no padding)."""
+        seq = seq.upper().replace("A", "0").replace("C", "1")
+        seq = seq.replace("G", "2").replace("T", "3").replace("N", "0")
+
+        seq_1hot = np.zeros((len(seq), 4), dtype=np.float32)
+        for i, c in enumerate(seq):
+            ci = ord(c) - ord("0")
+            if 0 <= ci <= 3:
+                seq_1hot[i, ci] = 1.0
+
+        return seq_1hot
+
+    def _dna_1hot(self, seq: str) -> np.ndarray:
+        """One-hot encode DNA sequence with padding."""
+        seq = seq.upper().replace("A", "0").replace("C", "1")
+        seq = seq.replace("G", "2").replace("T", "3").replace("N", "0")
+
+        seq_1hot = np.zeros((len(seq), 4), dtype=np.float32)
+        for i, c in enumerate(seq):
+            ci = ord(c) - ord("0")
+            if 0 <= ci <= 3:
+                seq_1hot[i, ci] = 1.0
+
+        # Handle length mismatch
+        if seq_1hot.shape[0] < self.config.seq_length:
+            padding = np.zeros((self.config.seq_length - seq_1hot.shape[0], 4), dtype=np.float32)
+            seq_1hot = np.vstack([seq_1hot, padding])
+        elif seq_1hot.shape[0] > self.config.seq_length:
+            seq_1hot = seq_1hot[: self.config.seq_length, :]
+
+        return seq_1hot
+
+    def _load_genome(self) -> dict[str, int]:
+        """Load genome chromosome sizes."""
+        fasta = pysam.FastaFile(str(self.fasta_file))
+        chrom_sizes = dict(zip(fasta.references, fasta.lengths))
+        fasta.close()
+        return chrom_sizes
+
+    def _create_sequence_regions(self) -> dict[str, list[GenomicRegion]]:
+        """Create sequence regions for each split.
+        
+        Uses block-based approach:
+        1. Divide genome into fixed-size blocks (block_size, default 1 Mb)
+        2. Split blocks into train/valid/test
+        3. Optionally join adjacent blocks within each split
+        4. Generate sliding windows within each block
+        """
+        chrom_sizes = self._load_genome()
+
+        # Use full sequence length for genomic regions
+        # Crop will be applied only to targets (Hi-C matrix), not to sequences
+        seq_length = self.config.seq_length
+
+        # Create fixed-size blocks
+        print(f"  Creating blocks of size {self.config.block_size}...")
+        blocks = self._create_genomic_blocks(chrom_sizes)
+        
+        # Filter for minimum length
+        blocks = [b for b in blocks if b.end - b.start >= seq_length]
+        print(f"  After length filter: {len(blocks)} blocks")
+
+        # Divide into train/valid/test
+        print(f"  Dividing blocks: test={self.config.test_pct}, valid={self.config.valid_pct}")
+        fold_blocks = self._divide_contigs_pct(
+            blocks,
+            self.config.test_pct,
+            self.config.valid_pct,
+        )
+
+        # Optionally join adjacent blocks within each fold
+        if self.config.join_blocks:
+            print(f"  Joining adjacent blocks within each split...")
+            for i in range(len(fold_blocks)):
+                fold_blocks[i] = self._rejoin_large_contigs(fold_blocks[i])
+
+        # Convert to GenomicRegion with labels
+        train_regions = self._contig_sequences(fold_blocks[0], seq_length, self.config.stride_train)
+        valid_regions = self._contig_sequences(fold_blocks[1], seq_length, self.config.stride_test)
+        test_regions = self._contig_sequences(fold_blocks[2], seq_length, self.config.stride_test)
+
+        # Shuffle each fold
+        np.random.shuffle(train_regions)
+        np.random.shuffle(valid_regions)
+        np.random.shuffle(test_regions)
+
+        # Apply sampling
+        if self.config.sample_pct < 1.0 and len(train_regions) > 0:
+            n_train = int(len(train_regions) * self.config.sample_pct)
+            indices = np.random.choice(len(train_regions), n_train, replace=False)
+            train_regions = [train_regions[i] for i in indices]
+
+        # Add labels
+        train_labeled = [GenomicRegion(r.chrom, r.start, r.end, "train") for r in train_regions]
+        valid_labeled = [GenomicRegion(r.chrom, r.start, r.end, "valid") for r in valid_regions]
+        test_labeled = [GenomicRegion(r.chrom, r.start, r.end, "test") for r in test_regions]
+
+        return {
+            "train": train_labeled,
+            "valid": valid_labeled,
+            "test": test_labeled,
+        }
+
+    def _create_genomic_blocks(self, chrom_sizes: dict[str, int]) -> list[Contig]:
+        """Divide genome into fixed-size blocks.
+        
+        Creates non-overlapping blocks of block_size (default 1 Mb) from each chromosome.
+        This ensures blocks are substantially larger than sequence length to preserve
+        local genomic structure and prevent information leakage.
+        
+        Args:
+            chrom_sizes: Dictionary mapping chromosome name to length
+            
+        Returns:
+            List of Contig objects representing fixed-size blocks
+        """
+        blocks = []
+        for chrom, length in chrom_sizes.items():
+            pos = 0
+            while pos + self.config.block_size <= length:
+                blocks.append(Contig(chrom, pos, pos + self.config.block_size))
+                pos += self.config.block_size
+            # Keep remainder if >= seq_length
+            remainder = length - pos
+            if remainder >= self.config.seq_length - 2 * self.config.crop_bp:
+                blocks.append(Contig(chrom, pos, length))
+        
+        print(f"  Created {len(blocks)} blocks of size {self.config.block_size}")
+        return blocks
+
+    def _divide_contigs_pct(
+        self,
+        contigs: list[Contig],
+        test_pct: float,
+        valid_pct: float,
+        pct_abstain: float = 0.2,
+    ) -> list[list[Contig]]:
+        """Divide contigs into train/valid/test by nucleotide percentage."""
+        # Sort contigs descending by length
+        length_contigs = [(ctg.end - ctg.start, ctg) for ctg in contigs]
+        length_contigs.sort(reverse=True)
+
+        # Compute total nucleotides
+        total_nt = sum(lc[0] for lc in length_contigs)
+
+        # Compute aimed train/valid/test nucleotides
+        test_nt_aim = test_pct * total_nt
+        valid_nt_aim = valid_pct * total_nt
+        train_nt_aim = total_nt - valid_nt_aim - test_nt_aim
+
+        # Initialize current nucleotides
+        train_nt = 0
+        valid_nt = 0
+        test_nt = 0
+
+        # Initialize contig lists
+        train_contigs = []
+        valid_contigs = []
+        test_contigs = []
+
+        # Process contigs
+        for ctg_len, ctg in length_contigs:
+            # Compute gap between current and aim
+            test_nt_gap = max(0, test_nt_aim - test_nt)
+            valid_nt_gap = max(0, valid_nt_aim - valid_nt)
+            train_nt_gap = max(1, train_nt_aim - train_nt)
+
+            # Skip if too large
+            if ctg_len > pct_abstain * test_nt_gap:
+                test_nt_gap = 0
+            if ctg_len > pct_abstain * valid_nt_gap:
+                valid_nt_gap = 0
+
+            # Compute remaining percentages
+            gap_sum = train_nt_gap + valid_nt_gap + test_nt_gap
+            if gap_sum == 0:
+                # All targets reached, add to train
+                train_contigs.append(ctg)
+                train_nt += ctg_len
+                continue
+
+            test_pct_gap = test_nt_gap / gap_sum
+            valid_pct_gap = valid_nt_gap / gap_sum
+            train_pct_gap = train_nt_gap / gap_sum
+
+            # Sample train/valid/test
+            ri = np.random.choice(3, p=[train_pct_gap, valid_pct_gap, test_pct_gap])
+            if ri == 0:
+                train_contigs.append(ctg)
+                train_nt += ctg_len
+            elif ri == 1:
+                valid_contigs.append(ctg)
+                valid_nt += ctg_len
+            else:
+                test_contigs.append(ctg)
+                test_nt += ctg_len
+
+        print(f"  Train: {len(train_contigs)} contigs, {train_nt} nt ({train_nt/total_nt:.4f})")
+        print(f"  Valid: {len(valid_contigs)} contigs, {valid_nt} nt ({valid_nt/total_nt:.4f})")
+        print(f"  Test:  {len(test_contigs)} contigs, {test_nt} nt ({test_nt/total_nt:.4f})")
+
+        return [train_contigs, valid_contigs, test_contigs]
+
+    def _rejoin_large_contigs(self, contigs: list[Contig]) -> list[Contig]:
+        """Rejoin contigs that were broken up before the split."""
+        if not contigs:
+            return contigs
+
+        # Group by chromosome
+        chr_contigs = {}
+        for ctg in contigs:
+            chr_contigs.setdefault(ctg.chr, []).append(ctg)
+
+        result = []
+        for chrom in chr_contigs:
+            # Sort by start position
+            chr_contigs[chrom].sort(key=lambda x: x.start)
+
+            ctg_ongoing = chr_contigs[chrom][0]
+            for i in range(1, len(chr_contigs[chrom])):
+                ctg_this = chr_contigs[chrom][i]
+                if ctg_ongoing.end == ctg_this.start:
+                    # Join
+                    ctg_ongoing = Contig(ctg_ongoing.chr, ctg_ongoing.start, ctg_this.end)
+                else:
+                    # Conclude ongoing
+                    result.append(ctg_ongoing)
+                    ctg_ongoing = ctg_this
+
+            # Conclude final
+            result.append(ctg_ongoing)
+
+        return result
+
+    def _contig_sequences(
+        self,
+        contigs: list[Contig],
+        seq_length: int,
+        stride: float,
+    ) -> list[GenomicRegion]:
+        """Convert contigs to sequence regions."""
+        regions = []
+        for ctg in contigs:
+            # Calculate start position (snapped)
+            seq_start = int(np.ceil(ctg.start / self.config.snap) * self.config.snap)
+            seq_end = seq_start + seq_length
+
+            while seq_end <= ctg.end:
+                regions.append(GenomicRegion(ctg.chr, seq_start, seq_end, None))
+                seq_start += int(stride)
+                seq_end += int(stride)
+
+        return regions
+
+    def _extract_targets(self, regions_by_split: dict[str, list[GenomicRegion]]) -> None:
+        """Extract targets for all regions using DatasetWriter."""
+        # Get target processor with crop_bp parameter
+        # Crop is applied only to targets (e.g., Hi-C matrix), not to sequences
+        processor = TargetProcessorRegistry.create(
+            self.config.target_type,
+            pool_width=self.config.pool_width,
+            diagonal_offset=self.config.diagonal_offset,
+            crop_bp=self.config.crop_bp,
+        )
+
+        # Process each split
+        for split, regions in regions_by_split.items():
+            if len(regions) == 0:
+                continue
+
+            print(f"  Processing {split}: {len(regions)} regions")
+
+            # Convert regions to tuple format
+            region_tuples = [(r.chrom, r.start, r.end) for r in regions]
+
+            # Process each target
+            all_targets = []
+            for ti, target_row in self.targets_df.iterrows():
+                target_file = target_row["file"]
+
+                # Process
+                targets = processor.process(target_file, region_tuples)
+                all_targets.append(targets)
+
+            # Stack targets: (num_targets, num_seqs, target_length) -> (num_seqs, target_length, num_targets)
+            targets_stacked = np.stack(all_targets, axis=-1)
+
+            # Write using DatasetWriter
+            self.writer.write_targets(split, targets_stacked)
+
+
+def prepare_dataset(
+    output_dir: str | Path,
+    fasta_file: str | Path,
+    targets_file: str | Path,
+    config: Optional[PreparationConfig] = None,
+    **kwargs,
+):
+    """Prepare a genomic dataset in v2 format.
+
+    Args:
+        output_dir: Output directory
+        fasta_file: Genome FASTA file
+        targets_file: Targets file (TSV)
+        config: Preparation config
+        **kwargs: Additional config options
+
+    Returns:
+        DatasetMetadata for the prepared dataset
+    """
+    # Merge config and kwargs
+    if config is None:
+        config = PreparationConfig()
+
+    for key, value in kwargs.items():
+        if hasattr(config, key):
+            setattr(config, key, value)
+
+    # Create preparator
+    preparator = DataPreparator(output_dir, fasta_file, targets_file, config)
+
+    # Run preparation
+    return preparator.prepare()

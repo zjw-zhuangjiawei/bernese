@@ -1,576 +1,441 @@
 # Copyright 2026
 # Licensed under the Apache License, Version 2.0
-"""Comprehensive training loop and utilities for SeqNN models."""
+"""Comprehensive training loop and utilities for SeqNN models.
 
+This module provides a Trainer class that combines:
+- Keras 3 SeqNN model for forward pass
+- PyTorch DataLoader for data iteration
+- PyTorch losses and metrics for training evaluation
+"""
+
+import itertools
 import json
-import math
 import os
-import time
-from typing import Optional, Dict, List, Union
-
-import torch
-import torch.nn as nn
-from torch.utils.data import DataLoader
-from torch.optim.lr_scheduler import _LRScheduler
+from pathlib import Path
+from typing import TypedDict, Optional
 
 import numpy as np
 
-from bernese.metrics import losses as loss_functions
-from bernese.metrics import metrics as metric_functions
+import keras
+from torch.utils.data import DataLoader
+
+from bernese.models.seqnn import SeqNN
+from bernese.metrics.losses import get_loss_function
+from bernese.metrics.metrics import get_metric
+
+
+class TrainConfig(TypedDict, total=False):
+    """Training configuration matching train.json fields.
+
+    Attributes:
+        batch_size: Training batch size
+        optimizer: Optimizer type (sgd, adam, adamw)
+        learning_rate: Initial learning rate
+        momentum: Momentum for SGD optimizer
+        weight_decay: Weight decay for regularization
+        loss: Loss function (mse, bce, poisson, mse_udot)
+        patience: Early stopping patience (epochs)
+        clip_norm: Gradient clipping norm (0 = disabled)
+        train_epochs_max: Maximum training epochs
+        eval_interval: Validation evaluation interval (epochs)
+        save_interval: Checkpoint save interval (epochs)
+        metrics: List of metrics to compute (pearsonr, r2, auroc, auprc)
+    """
+
+    batch_size: int
+    optimizer: str
+    learning_rate: float
+    momentum: float
+    weight_decay: float
+    loss: str
+    patience: int
+    clip_norm: float
+    train_epochs_max: int
+    eval_interval: int
+    save_interval: int
+    metrics: list[str]
 
 
 class Trainer:
     """Comprehensive trainer class for SeqNN models.
+
+    This trainer uses a hybrid approach:
+    - Keras 3 model for forward pass and weight updates
+    - PyTorch DataLoader for data iteration
+    - PyTorch losses and metrics for evaluation
 
     Args:
         model: The SeqNN model to train
         train_loader: Training data loader (or list of loaders for multi-dataset)
         val_loader: Validation data loader (or list of loaders)
         config: Training configuration dictionary
-        device: Device to train on
+        device: Device to train on (cuda/cpu)
     """
 
     def __init__(
         self,
-        model: nn.Module,
-        train_loader: Union[DataLoader, List[DataLoader]],
-        val_loader: Union[DataLoader, List[DataLoader]],
-        config: dict,
-        device: str = "cuda" if torch.cuda.is_available() else "cpu",
+        model: SeqNN,
+        train_loader: DataLoader | list[DataLoader],
+        val_loader: DataLoader | list[DataLoader],
+        config: TrainConfig,
+        device: str = "cuda",
     ):
-        self.model = model.to(device)
-        self.device = device
+        self.model = model
+        self.train_loader = train_loader
+        self.val_loader = val_loader
         self.config = config
+        self.device = device
 
-        # Handle single or multiple data loaders
-        if isinstance(train_loader, list):
-            self.train_loaders = train_loader
-            self.num_datasets = len(train_loader)
-        else:
-            self.train_loaders = [train_loader]
-            self.num_datasets = 1
+        # Get num_targets from model
+        self.num_targets = model.get_num_targets()
 
-        if isinstance(val_loader, list):
-            self.val_loaders = val_loader
-        else:
-            self.val_loaders = [val_loader]
+        # Create optimizer
+        self.optimizer = self._create_optimizer()
 
-        # Loss function
-        self.loss_fn = self._create_loss_function(config)
+        # Create loss function (PyTorch)
+        self.loss_fn = get_loss_function(config.get("loss", "mse"))
 
-        # Metrics
-        self._setup_metrics(config)
+        # Create metrics (PyTorch)
+        self.metrics = self._create_metrics()
 
-        # Optimizer
-        self.optimizer = self._create_optimizer(config)
-
-        # Learning rate scheduler
-        self.scheduler = self._create_scheduler(config)
+        self.model.model.compile(optimizer=self.optimizer, loss=self.loss_fn)
 
         # Training state
         self.current_epoch = 0
-        self.best_metric = float("-inf")
-        self.best_metric_name = config.get("best_metric", "val_loss")
-        self.patience = config.get("patience", 20)
-        self.train_epochs_min = config.get("train_epochs_min", 1)
-        self.train_epochs_max = config.get("train_epochs_max", 10000)
+        self.best_val_loss = float("inf")
+        self.patience_counter = 0
+        self.history = {
+            "train_loss": [],
+            "val_loss": [],
+        }
 
-        # Gradient clipping
-        self.clip_norm = config.get("clip_norm", None)
-        self.global_clipnorm = config.get("global_clipnorm", None)
+    def _create_optimizer(self) -> keras.optimizers.Optimizer:
+        """Create Keras optimizer from config."""
+        opt_type = self.config.get("optimizer", "adam").lower()
+        lr = self.config.get("learning_rate", 0.001)
+        momentum = self.config.get("momentum", 0.0)
+        weight_decay = self.config.get("weight_decay", 0.0)
 
-    def _create_loss_function(self, config: dict) -> nn.Module:
-        """Create loss function from config."""
-        loss_name = str(config.get("loss", "mse")).lower()
-
-        # Get loss-specific parameters
-        loss_kwargs = {}
-        if loss_name == "poisson_kl" or loss_name == "mse_udot":
-            loss_kwargs["udot_weight"] = config.get("spec_weight", 1.0)
-        elif loss_name == "poisson_multinomial":
-            loss_kwargs["total_weight"] = config.get("total_weight", 1.0)
-            loss_kwargs["weight_range"] = config.get("weight_range", 1.0)
-            loss_kwargs["weight_exp"] = config.get("weight_exp", 4)
-
-        return loss_functions.get_loss_function(loss_name, **loss_kwargs)
-
-    def _setup_metrics(self, config: dict):
-        """Setup metrics for training and validation."""
-        self.train_metrics: dict[str, nn.Module] = {}
-        self.val_metrics: dict[str, nn.Module] = {}
-
-        # Get num_targets from model or config
-        num_targets = config.get("num_targets", 1)
-        loss = str(config.get("loss", "mse")).lower()
-
-        if loss == "bce":
-            # Binary classification metrics
-            self.val_metrics["auroc"] = metric_functions.SeqAUC("ROC", summarize=True)
-            self.val_metrics["auprc"] = metric_functions.SeqAUC("PR", summarize=True)
-        else:
-            # Regression metrics
-            self.val_metrics["pearsonr"] = metric_functions.PearsonR(num_targets, summarize=True)
-            self.val_metrics["r2"] = metric_functions.R2(num_targets, summarize=True)
-
-    def _create_optimizer(self, config: dict) -> torch.optim.Optimizer:
-        """Create optimizer from config."""
-        optimizer_type = str(config.get("optimizer", "adam")).lower()
-        lr = config.get("learning_rate", config.get("initial_learning_rate", 0.001))
-
-        # Weight decay
-        weight_decay = config.get("weight_decay", 0.0)
-
-        if optimizer_type == "adam":
-            return torch.optim.Adam(
-                self.model.parameters(),
-                lr=lr,
-                betas=(config.get("adam_beta1", 0.9), config.get("adam_beta2", 0.999)),
+        if opt_type == "sgd":
+            return keras.optimizers.SGD(
+                learning_rate=lr,
+                momentum=momentum,
                 weight_decay=weight_decay,
             )
-        elif optimizer_type == "adamw":
-            return torch.optim.AdamW(
-                self.model.parameters(),
-                lr=lr,
-                betas=(config.get("adam_beta1", 0.9), config.get("adam_beta2", 0.999)),
+        elif opt_type == "adam":
+            return keras.optimizers.Adam(
+                learning_rate=lr,
                 weight_decay=weight_decay,
             )
-        elif optimizer_type in ["sgd", "momentum"]:
-            return torch.optim.SGD(
-                self.model.parameters(),
-                lr=lr,
-                momentum=config.get("momentum", 0.99),
+        elif opt_type == "adamw":
+            return keras.optimizers.AdamW(
+                learning_rate=lr,
                 weight_decay=weight_decay,
             )
         else:
-            raise ValueError(f"Unknown optimizer: {optimizer_type}")
+            raise ValueError(f"Unknown optimizer: {opt_type}")
 
-    def _create_scheduler(self, config: dict) -> Optional[_LRScheduler]:
-        """Create learning rate scheduler from config."""
-        # Check for cyclical LR
-        has_cyclical = (
-            "initial_learning_rate" in config
-            and "maximal_learning_rate" in config
-            and "final_learning_rate" in config
-            and "train_epochs_cycle1" in config
-        )
+    def _create_metrics(self) -> dict:
+        """Create metrics dictionary."""
+        metrics_config = self.config.get("metrics", ["pearsonr"])
+        metrics = {}
 
-        if has_cyclical:
-            # Calculate step size
-            batches_per_epoch = len(self.train_loaders[0])
-            step_size = int(config["train_epochs_cycle1"]) * batches_per_epoch
-
-            return Cyclical1LearningRate(
-                initial_learning_rate=float(config["initial_learning_rate"]),
-                maximal_learning_rate=float(config["maximal_learning_rate"]),
-                final_learning_rate=float(config["final_learning_rate"]),
-                step_size=step_size,
+        for metric_name in metrics_config:
+            metrics[metric_name] = get_metric(
+                metric_name,
+                num_targets=self.num_targets,
+                summarize=True,
             )
-        elif "warmup_steps" in config:
-            # Warmup + decay
-            return WarmUpScheduler(
-                initial_learning_rate=float(config.get("learning_rate", 0.001)),
-                warmup_steps=int(config["warmup_steps"]),
-                decay_type=str(config.get("decay_type", "exponential")),
-                decay_steps=int(config.get("decay_steps", 100000)),
-                decay_rate=float(config.get("decay_rate", 0.96)),
-                optimizer=self.optimizer,
-            )
-        elif "decay_steps" in config:
-            # Exponential decay
-            return torch.optim.lr_scheduler.ExponentialLR(
-                self.optimizer,
-                gamma=float(config.get("decay_rate", 0.96)),
-            )
-
-        return None
-
-    def train_epoch(self) -> Dict[str, float]:
-        """Train for one epoch.
-
-        Returns:
-            Dictionary of training metrics
-        """
-        self.model.train()
-        total_loss = 0.0
-        num_batches = 0
-
-        # Handle multiple datasets (round-robin)
-        if self.num_datasets > 1:
-            # Get iterators for each dataset
-            train_iters = [iter(loader) for loader in self.train_loaders]
-
-            # Calculate total batches
-            total_batches = sum(len(loader) for loader in self.train_loaders)
-
-            # Create dataset indices
-            dataset_indexes = []
-            for di, loader in enumerate(self.train_loaders):
-                dataset_indexes.extend([di] * len(loader))
-            dataset_indexes = np.array(dataset_indexes)
-            np.random.shuffle(dataset_indexes)
-
-            for di in dataset_indexes:
-                try:
-                    sequences, targets = next(train_iters[di])
-                except StopIteration:
-                    train_iters[di] = iter(self.train_loaders[di])
-                    sequences, targets = next(train_iters[di])
-
-                loss = self._train_step(sequences, targets)
-                total_loss += loss
-                num_batches += 1
-        else:
-            # Single dataset
-            for sequences, targets in self.train_loaders[0]:
-                loss = self._train_step(sequences, targets)
-                total_loss += loss
-                num_batches += 1
-
-        return {"loss": total_loss / max(num_batches, 1)}
-
-    def _train_step(self, sequences: torch.Tensor, targets: torch.Tensor) -> float:
-        """Single training step.
-
-        Args:
-            sequences: Input sequences
-            targets: Target values
-
-        Returns:
-            Loss value
-        """
-        sequences = sequences.to(self.device)
-        targets = targets.to(self.device)
-
-        self.optimizer.zero_grad()
-
-        # Forward pass
-        predictions = self.model(sequences)
-
-        # Handle multi-head output
-        if isinstance(predictions, list):
-            predictions = predictions[0]
-
-        # Compute loss
-        loss = self.loss_fn(predictions, targets)
-
-        # Backward pass
-        loss.backward()
-
-        # Gradient clipping
-        if self.clip_norm is not None:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.clip_norm)
-        elif self.global_clipnorm is not None:
-            torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.global_clipnorm)
-
-        self.optimizer.step()
-
-        return loss.item()
-
-    def validate(self) -> Dict[str, float]:
-        """Validate the model.
-
-        Returns:
-            Dictionary of validation metrics
-        """
-        self.model.eval()
-
-        # Reset metrics
-        for metric in self.val_metrics.values():
-            if hasattr(metric, "reset"):
-                metric.reset()
-
-        total_loss = 0.0
-        num_batches = 0
-
-        with torch.no_grad():
-            for loader in self.val_loaders:
-                for sequences, targets in loader:
-                    sequences = sequences.to(self.device)
-                    targets = targets.to(self.device)
-
-                    # Forward pass
-                    predictions = self.model(sequences)
-
-                    if isinstance(predictions, list):
-                        predictions = predictions[0]
-
-                    # Compute loss
-                    loss = self.loss_fn(predictions, targets)
-                    total_loss += loss.item()
-                    num_batches += 1
-
-                    # Update metrics
-                    for metric in self.val_metrics.values():
-                        metric(predictions, targets)
-
-        # Compute metrics
-        metrics = {"val_loss": total_loss / max(num_batches, 1)}
-
-        for name, metric in self.val_metrics.items():
-            if hasattr(metric, "compute"):
-                metrics[f"val_{name}"] = metric.compute().item()
-            elif hasattr(metric, "forward"):
-                # Already computed in loop
-                pass
 
         return metrics
 
     def fit(
         self,
         epochs: Optional[int] = None,
-        out_dir: Optional[str] = None,
+        out_dir: str = "train_out",
         resume_from: Optional[str] = None,
-    ):
-        """Train the model for specified number of epochs.
+    ) -> dict:
+        """Train the model.
 
         Args:
-            epochs: Number of epochs to train (default: from config)
-            out_dir: Directory for checkpoints
-            resume_from: Path to checkpoint to resume from
+            epochs: Number of training epochs (overrides config)
+            out_dir: Output directory for checkpoints
+            resume_from: Checkpoint path to resume from
+
+        Returns:
+            Training history dictionary
         """
-        # Determine epochs
-        if epochs is None:
-            epochs = self.train_epochs_max
+        epochs = epochs or self.config.get("train_epochs_max", 100)
 
-        # Setup directories
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
+        # Create output directory
+        os.makedirs(out_dir, exist_ok=True)
 
-        # Resume from checkpoint
-        start_epoch = 0
-        if resume_from and os.path.exists(resume_from):
-            self.load_checkpoint(resume_from)
-            start_epoch = self.current_epoch + 1
-            print(f"Resumed from epoch {start_epoch}")
+        # Resume from checkpoint if specified
+        if resume_from:
+            self._load_checkpoint(resume_from)
 
-        patience_counter = 0
+        print(f"Starting training for {epochs} epochs...")
+        print(f"Optimizer: {self.config.get('optimizer', 'adam')}")
+        print(f"Learning rate: {self.config.get('learning_rate', 0.001)}")
+        print(f"Loss: {self.config.get('loss', 'mse')}")
+        print(f"Batch size: {self.config.get('batch_size', 64)}")
+        print("-" * 60)
 
-        for epoch in range(start_epoch, epochs):
-            # Check early stopping
-            if epoch >= self.train_epochs_min and patience_counter >= self.patience:
-                print(f"Early stopping at epoch {epoch}")
-                break
-
+        for epoch in range(self.current_epoch, epochs):
             self.current_epoch = epoch
-            t0 = time.time()
 
-            # Train
-            train_metrics = self.train_epoch()
+            # Train one epoch
+            train_loss = self._train_epoch()
+            self.history["train_loss"].append(train_loss)
+
+            print(f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.6f}")
 
             # Validate
-            val_metrics = self.validate()
+            if (epoch + 1) % self.config.get("eval_interval", 1) == 0:
+                val_loss, val_metrics = self._validate()
+                self.history["val_loss"].append(val_loss)
 
-            # Compute epoch time
-            epoch_time = time.time() - t0
+                # Print metrics
+                metrics_str = " - ".join([f"{k}: {v:.4f}" for k, v in val_metrics.items()])
+                print(f"Epoch {epoch + 1}/{epochs} - val_loss: {val_loss:.6f} - {metrics_str}")
 
-            # Print progress
-            self._print_progress(epoch, epoch_time, train_metrics, val_metrics)
+                # Early stopping check
+                if val_loss < self.best_val_loss:
+                    self.best_val_loss = val_loss
+                    self.patience_counter = 0
+                    # Save best model
+                    best_path = os.path.join(out_dir, "best_model.weights.h5")
+                    self.model.model.save_weights(best_path)
+                    print(f"  -> Saved best model (val_loss: {val_loss:.6f})")
+                else:
+                    self.patience_counter += 1
 
-            # Learning rate scheduling
-            if self.scheduler:
-                self.scheduler.step()
+                if self.patience_counter >= self.config.get("patience", 10):
+                    print(f"Early stopping at epoch {epoch + 1}")
+                    break
 
-            # Determine metric for early stopping and best model
-            if self.best_metric_name == "val_loss":
-                current_metric = -val_metrics.get("val_loss", 0)
-            else:
-                current_metric = val_metrics.get(f"val_{self.best_metric_name}", 0)
+            # Periodic checkpoint
+            if (epoch + 1) % self.config.get("save_interval", 1) == 0:
+                checkpoint_path = os.path.join(out_dir, f"checkpoint_{epoch + 1}.weights.h5")
+                self.model.model.save_weights(checkpoint_path)
 
-            # Check for improvement
-            if current_metric > self.best_metric:
-                self.best_metric = current_metric
-                patience_counter = 0
+        print("Training complete!")
+        return self.history
 
-                # Save best model
-                if out_dir:
-                    self.save_checkpoint(os.path.join(out_dir, "best_model.pt"))
-            else:
-                patience_counter += 1
+    def _train_epoch(self) -> float:
+        """Train for one epoch.
 
-            # Save checkpoint
-            if out_dir:
-                self.save_checkpoint(os.path.join(out_dir, f"checkpoint_epoch_{epoch}.pt"))
+        Returns:
+            Average training loss
+        """
+        self.model.model.trainable = True
 
-        print(f"Training complete. Best {self.best_metric_name}: {self.best_metric:.4f}")
+        # Handle multiple data loaders (multi-dataset)
+        loaders = self.train_loader if isinstance(self.train_loader, list) else [self.train_loader]
+        num_loaders = len(loaders)
 
-    def _print_progress(
-        self, epoch: int, epoch_time: float, train_metrics: Dict, val_metrics: Dict
-    ):
-        """Print training progress."""
-        loss_str = f"loss: {train_metrics.get('loss', 0):.4f}"
-        val_str = f"val_loss: {val_metrics.get('val_loss', 0):.4f}"
+        total_loss = 0.0
+        num_batches = 0
 
-        # Add metrics
-        for name, metric in self.val_metrics.items():
-            if hasattr(metric, "compute"):
-                val = metric.compute().item()
-                val_str += f" - val_{name}: {val:.4f}"
+        # Round-robin through data loaders
+        if num_loaders > 1:
+            # Multi-dataset: round-robin sampling
+            iterators = [iter(loader) for loader in loaders]
 
-        print(f"Epoch {epoch} - {epoch_time:.1f}s - {loss_str} - {val_str}", flush=True)
+            while True:
+                has_data = False
+                for it in iterators:
+                    try:
+                        batch = next(it)
+                        sequences, targets = batch
+                        has_data = True
 
-    def save_checkpoint(self, path: str):
-        """Save model checkpoint."""
-        torch.save(
-            {
-                "epoch": self.current_epoch,
-                "model_state_dict": self.model.state_dict(),
-                "optimizer_state_dict": self.optimizer.state_dict(),
-                "scheduler_state_dict": self.scheduler.state_dict() if self.scheduler else None,
-                "best_metric": self.best_metric,
-                "config": self.config,
-            },
-            path,
-        )
+                        # Convert to numpy
+                        X = sequences.numpy().astype("float32")
+                        y = targets.numpy().astype("float32")
 
-    def load_checkpoint(self, path: str):
-        """Load model checkpoint."""
-        checkpoint = torch.load(path, map_location=self.device)
-        self.model.load_state_dict(checkpoint["model_state_dict"])
-        self.optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+                        # Forward pass via Keras train_on_batch
+                        loss = self.model.model.train_on_batch(X, y)
 
-        if self.scheduler and checkpoint.get("scheduler_state_dict"):
-            self.scheduler.load_state_dict(checkpoint["scheduler_state_dict"])
+                        total_loss += loss
+                        num_batches += 1
+                    except StopIteration:
+                        pass
 
-        self.current_epoch = checkpoint["epoch"]
-        self.best_metric = checkpoint["best_metric"]
-
-
-# Learning rate schedulers
-
-
-class Cyclical1LearningRate(_LRScheduler):
-    """Cyclical learning rate schedule.
-
-    Args:
-        initial_learning_rate: Starting learning rate
-        maximal_learning_rate: Peak learning rate
-        final_learning_rate: Minimum learning rate after cycle
-        step_size: Number of steps per half cycle
-        optimizer: Wrapped optimizer
-    """
-
-    def __init__(
-        self,
-        initial_learning_rate: float,
-        maximal_learning_rate: float,
-        final_learning_rate: float,
-        step_size: int,
-        optimizer: torch.optim.Optimizer,
-    ):
-        self.initial_learning_rate = initial_learning_rate
-        self.maximal_learning_rate = maximal_learning_rate
-        self.final_learning_rate = final_learning_rate
-        self.step_size = step_size
-        super().__init__(optimizer)
-
-    def get_lr(self):
-        """Compute learning rate for current step."""
-        cycle = math.floor(1 + self.last_epoch / (2 * self.step_size))
-        x = abs(self.last_epoch / self.step_size - 2 * cycle + 1)
-
-        lr = torch.where(
-            torch.tensor(self.last_epoch) > 2 * self.step_size,
-            torch.tensor(self.final_learning_rate),
-            torch.tensor(self.initial_learning_rate)
-            + (torch.tensor(self.maximal_learning_rate) - torch.tensor(self.initial_learning_rate))
-            * torch.max(torch.tensor(0), 1 - x),
-        )
-
-        return [lr.item()] * len(self.base_lrs)
-
-
-class WarmUpScheduler(torch.optim.lr_scheduler._LRScheduler):
-    """Learning rate scheduler with warmup.
-
-    Args:
-        initial_learning_rate: Learning rate after warmup
-        warmup_steps: Number of warmup steps
-        decay_type: Type of decay after warmup ('exponential' or 'linear')
-        decay_steps: Steps for decay
-        decay_rate: Decay rate
-        optimizer: Wrapped optimizer
-    """
-
-    def __init__(
-        self,
-        optimizer: torch.optim.Optimizer,
-        initial_learning_rate: float,
-        warmup_steps: int,
-        decay_type: str = "exponential",
-        decay_steps: int = 100000,
-        decay_rate: float = 0.96,
-    ):
-        self.initial_learning_rate = initial_learning_rate
-        self.warmup_steps = warmup_steps
-        self.decay_type = decay_type
-        self.decay_steps = decay_steps
-        self.decay_rate = decay_rate
-        super().__init__(optimizer)
-
-    def get_lr(self):
-        """Compute learning rate for current step."""
-        if self.last_epoch < self.warmup_steps:
-            # Linear warmup
-            warmup_factor = self.last_epoch / max(1, self.warmup_steps)
-            return [base_lr * warmup_factor for base_lr in self.base_lrs]
+                if not has_data:
+                    break
         else:
-            # Decay
-            if self.decay_type == "exponential":
-                decay_factor = self.decay_rate ** (
-                    (self.last_epoch - self.warmup_steps) / self.decay_steps
-                )
-            else:
-                decay_factor = 1 - (self.last_epoch - self.warmup_steps) / self.decay_steps
-                decay_factor = max(decay_factor, 0)
+            # Single dataset
+            for batch in loaders[0]:
+                sequences, targets = batch
 
-            return [base_lr * decay_factor for base_lr in self.base_lrs]
+                # Convert to numpy
+                X = sequences.numpy().astype("float32")
+                y = targets.numpy().astype("float32")
+
+                # Forward pass via Keras train_on_batch
+                loss = self.model.model.train_on_batch(X, y)
+
+                total_loss += loss
+                num_batches += 1
+
+        return total_loss / max(num_batches, 1)
+
+    def _validate(self) -> tuple[float, dict]:
+        """Validate the model.
+
+        Returns:
+            Tuple of (validation loss, metrics dict)
+        """
+        self.model.model.trainable = False
+
+        # Handle multiple data loaders
+        loaders = self.val_loader if isinstance(self.val_loader, list) else [self.val_loader]
+
+        total_loss = 0.0
+        num_batches = 0
+
+        # Reset metrics
+        for metric in self.metrics.values():
+            if hasattr(metric, "reset"):
+                metric.reset()
+
+        # Collect all predictions and targets for metric computation
+        all_preds = []
+        all_targets = []
+
+        for loader in loaders:
+            for batch in loader:
+                sequences, targets = batch
+
+                # Convert to numpy
+                X = sequences.numpy().astype("float32")
+                y = targets.numpy().astype("float32")
+
+                # Predict
+                preds = self.model.model.predict(X, verbose=0)
+
+                # Compute loss (PyTorch style for metrics)
+                # Convert back to torch for metric computation
+                import torch
+
+                preds_tensor = torch.from_numpy(preds) if isinstance(preds, np.ndarray) else preds
+                targets_tensor = torch.from_numpy(y) if isinstance(y, np.ndarray) else y
+
+                # Compute loss
+                if hasattr(self.loss_fn, "forward"):
+                    loss = self.loss_fn(preds_tensor, targets_tensor).item()
+                else:
+                    loss = np.mean((preds - y) ** 2)
+
+                total_loss += loss
+                num_batches += 1
+
+                # Collect for metrics
+                all_preds.append(
+                    preds_tensor
+                    if isinstance(preds_tensor, torch.Tensor)
+                    else torch.from_numpy(preds)
+                )
+                all_targets.append(
+                    targets_tensor
+                    if isinstance(targets_tensor, torch.Tensor)
+                    else torch.from_numpy(y)
+                )
+
+        # Compute metrics
+        metrics = {}
+        if len(all_preds) > 0:
+            import torch
+
+            all_preds = torch.cat(all_preds, dim=0)
+            all_targets = torch.cat(all_targets, dim=0)
+
+            for metric_name, metric_fn in self.metrics.items():
+                try:
+                    metric_value = metric_fn(all_targets, all_preds)
+                    if hasattr(metric_value, "item"):
+                        metric_value = metric_value.item()
+                    metrics[metric_name] = metric_value
+                except Exception as e:
+                    metrics[metric_name] = 0.0
+
+        val_loss = total_loss / max(num_batches, 1)
+        return val_loss, metrics
+
+    def _save_checkpoint(self, path: str):
+        """Save model weights and training state.
+
+        Args:
+            path: Path to save checkpoint
+        """
+        # Save Keras model weights
+        self.model.model.save_weights(path)
+
+        # Save training state (JSON)
+        state_path = path.replace(".weights.h5", "_state.json")
+        state = {
+            "epoch": self.current_epoch + 1,
+            "best_val_loss": self.best_val_loss,
+            "patience_counter": self.patience_counter,
+            "config": dict(self.config),
+        }
+        with open(state_path, "w") as f:
+            json.dump(state, f, indent=2)
+
+    def _load_checkpoint(self, path: str):
+        """Load model weights and training state.
+
+        Args:
+            path: Path to checkpoint
+        """
+        # Load Keras weights
+        self.model.model.load_weights(path)
+
+        # Load training state
+        state_path = path.replace(".weights.h5", "_state.json")
+        if os.path.exists(state_path):
+            with open(state_path) as f:
+                state = json.load(f)
+            self.current_epoch = state.get("epoch", 0)
+            self.best_val_loss = state.get("best_val_loss", float("inf"))
+            self.patience_counter = state.get("patience_counter", 0)
+            print(f"Resumed from epoch {self.current_epoch}")
 
 
 def create_trainer_from_config(
-    model: nn.Module,
-    train_loader: Union[DataLoader, List[DataLoader]],
-    val_loader: Union[DataLoader, List[DataLoader]],
-    config: Dict,
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
+    model: SeqNN,
+    train_loader: DataLoader | list[DataLoader],
+    val_loader: DataLoader | list[DataLoader],
+    config: dict,
+    device: str = "cuda",
 ) -> Trainer:
-    """Factory function to create trainer from config.
+    """Factory function to create Trainer from config dict.
 
     Args:
-        model: The model to train
-        train_loader: Training data loader(s)
-        val_loader: Validation data loader(s)
-        config: Training configuration
+        model: The SeqNN model to train
+        train_loader: Training data loader
+        val_loader: Validation data loader
+        config: Configuration dictionary (e.g., from train.json)
         device: Device to train on
 
     Returns:
         Trainer instance
     """
-    return Trainer(model, train_loader, val_loader, config, device)
+    # Convert dict to TrainConfig with defaults
+    train_config: TrainConfig = {
+        "batch_size": config.get("batch_size", 64),
+        "optimizer": config.get("optimizer", "adam"),
+        "learning_rate": config.get("learning_rate", 0.001),
+        "momentum": config.get("momentum", 0.0),
+        "weight_decay": config.get("weight_decay", 0.0),
+        "loss": config.get("loss", "mse"),
+        "patience": config.get("patience", 10),
+        "clip_norm": config.get("clip_norm", 0.0),
+        "train_epochs_max": config.get("train_epochs_max", 100),
+        "eval_interval": config.get("eval_interval", 1),
+        "save_interval": config.get("save_interval", 1),
+        "metrics": config.get("metrics", ["pearsonr"]),
+    }
 
-
-# Convenience function to load config and create trainer
-
-
-def train_from_json(
-    model: nn.Module,
-    config_path: str,
-    train_loader: Union[DataLoader, List[DataLoader]],
-    val_loader: Union[DataLoader, List[DataLoader]],
-    device: str = "cuda" if torch.cuda.is_available() else "cpu",
-) -> Trainer:
-    """Create trainer from JSON config file.
-
-    Args:
-        model: The model to train
-        config_path: Path to JSON config file
-        train_loader: Training data loader(s)
-        val_loader: Validation data loader(s)
-        device: Device to train on
-
-    Returns:
-        Trainer instance
-    """
-    with open(config_path, "r") as f:
-        config = json.load(f)
-
-    return create_trainer_from_config(model, train_loader, val_loader, config, device)
+    return Trainer(model, train_loader, val_loader, train_config, device)

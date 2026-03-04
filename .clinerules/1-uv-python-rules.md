@@ -4,7 +4,7 @@
 
 **Why**: `uv` provides significantly faster dependency resolution and installation compared to pip. These rules ensure consistent workflows across the project and leverage uv's best features for library development.
 
-Last updated: 2026-02-28
+Last updated: 2026-03-04
 
 ---
 
