@@ -89,9 +89,11 @@ class TargetProcessorRegistry:
         Returns:
             Decorator function
         """
+
         def decorator(processor_cls: type[TargetProcessor]) -> type[TargetProcessor]:
             cls._processors[target_type] = processor_cls
             return processor_cls
+
         return decorator
 
     @classmethod
@@ -109,8 +111,7 @@ class TargetProcessorRegistry:
         """
         if target_type not in cls._processors:
             raise ValueError(
-                f"Unknown target type: {target_type}. "
-                f"Available: {list(cls._processors.keys())}"
+                f"Unknown target type: {target_type}. Available: {list(cls._processors.keys())}"
             )
         return cls._processors[target_type]
 

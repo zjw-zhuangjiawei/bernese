@@ -170,12 +170,3 @@ class BigWigTargetProcessor(TargetProcessor):
         """
         with h5py.File(output_path, mode) as f:
             f.create_dataset("data", data=targets, chunks=(1024, -1), compression="gzip")
-
-
-@TargetProcessorRegistry.register("bw")
-class BigWigAlias(BigWigTargetProcessor):
-    """Alias for BigWig processor."""
-
-    @property
-    def target_type(self) -> str:
-        return "bw"

@@ -13,7 +13,7 @@ import keras
 import torch
 import typer
 
-from bernese.models import create_seqnn
+from bernese.models import SeqNN, SeqNNConfig
 
 
 def summary(
@@ -42,30 +42,20 @@ def summary(
         bernese summary params.json --num_targets 100
         bernese summary params.json --seq_length 2048 --device cpu
     """
-    import json
-
-    # Load configuration
-    with open(params_file, "r") as f:
-        params = json.load(f)
-
-    # Extract model parameters
-    params_model = params.get("model", params)
+    # Load configuration using Pydantic
+    config = SeqNNConfig.from_json(str(params_file))
 
     # Override with command-line arguments
     if num_targets is not None:
-        params_model["num_targets"] = num_targets
+        config.num_targets = num_targets
     if seq_length is not None:
-        params_model["seq_length"] = seq_length
-
-    # Set seq_depth
-    params_model["seq_depth"] = seq_depth
+        config.seq_length = seq_length
+    config.seq_depth = seq_depth
+    config.verbose = verbose > 0
 
     # Ensure num_targets has a default
-    if "num_targets" not in params_model:
-        params_model["num_targets"] = 1
-
-    # Set verbose for model building
-    params_model["verbose"] = verbose > 0
+    if config.num_targets is None:
+        config.num_targets = 1
 
     # Create model
     print(f"Loading model from: {params_file}")
@@ -74,11 +64,11 @@ def summary(
     print("-" * 60)
 
     # Create model
-    model = create_seqnn(params_model)
+    model = SeqNN(config)
 
     # Get model info
-    seq_len = params_model.get("seq_length", 1344)
-    seq_depth_val = params_model.get("seq_depth", 4)
+    seq_len = config.seq_length
+    seq_depth_val = config.seq_depth
     num_targets_val = model.get_num_targets()
 
     # Print summary

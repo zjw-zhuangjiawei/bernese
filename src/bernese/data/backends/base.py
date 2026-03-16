@@ -87,12 +87,21 @@ class DataWriter(Protocol):
 
 @dataclass
 class SplitMetadata:
-    """Metadata for a dataset split (train/valid/test)."""
+    """Metadata for a dataset split (train/valid/test).
+
+    In v2.0+ format, each split is stored in a single flat file:
+        {split}.h5 (e.g., train.h5, valid.h5)
+
+    The file contains:
+        /indices/chrom    - chromosome names (fixed-length strings)
+        /indices/start   - start positions (int32)
+        /indices/end     - end positions (int32)
+        /targets/data    - target values (N, target_length, num_targets)
+    """
 
     name: str
     num_seqs: int
-    coordinate_file: str
-    target_file: str | None = None
+    split_file: str  # e.g., "train.h5" (flat format)
 
 
 @dataclass
@@ -133,25 +142,19 @@ class DatasetMetadata:
     @classmethod
     def from_manifest(cls, manifest_path: Path) -> "DatasetMetadata":
         """Load metadata from manifest.json.
-        
-        Relative paths in the manifest are resolved from the manifest's directory.
+
+        Supports both v2.0 flat format and legacy nested format.
+        v2.0: {split}.h5 (e.g., train.h5)
+        Legacy: sequences/{split}/indices.h5 + targets/{split}.h5
         """
         # Get manifest directory for resolving relative paths
         manifest_dir = Path(manifest_path).parent
 
-        def resolve_path(path: str | None) -> str:
-            """Resolve relative paths from manifest directory."""
-            if not path:
-                return ""
-            p = Path(path)
-            if p.is_absolute():
-                return path
-            # Resolve relative to manifest directory
-            resolved = manifest_dir / p
-            return str(resolved.resolve())
-
         with open(manifest_path) as f:
             data = json.load(f)
+
+        # Check version
+        version = data.get("version", "2.0")
 
         # Parse genome
         genome = None
@@ -161,16 +164,41 @@ class DatasetMetadata:
                 name=g.get("name", ""),
             )
 
-        # Parse splits
+        # Parse splits - support both flat and legacy formats
         splits = {}
         if "sequences" in data and "splits" in data["sequences"]:
             for name, info in data["sequences"]["splits"].items():
-                splits[name] = SplitMetadata(
-                    name=name,
-                    num_seqs=info.get("num_seqs", 0),
-                    coordinate_file=resolve_path(info.get("coordinate_file", "")),
-                    target_file=resolve_path(info.get("target_file")),
-                )
+                # v2.0 flat format: split_file = "train.h5"
+                # Legacy format: coordinate_file + target_file
+                split_file = info.get("split_file")
+                if split_file:
+                    # v2.0 format
+                    splits[name] = SplitMetadata(
+                        name=name,
+                        num_seqs=info.get("num_seqs", 0),
+                        split_file=split_file,
+                    )
+                else:
+                    # Legacy format - convert to flat format path
+                    coord_file = info.get("coordinate_file", "")
+                    if coord_file:
+                        # Extract split name from path like "sequences/train/indices.h5"
+                        # Convert to flat format "train.h5"
+                        parts = Path(coord_file).parts
+                        if len(parts) >= 2:
+                            legacy_split = parts[1]  # e.g., "train"
+                            splits[name] = SplitMetadata(
+                                name=name,
+                                num_seqs=info.get("num_seqs", 0),
+                                split_file=f"{legacy_split}.h5",
+                            )
+                        else:
+                            # Fallback
+                            splits[name] = SplitMetadata(
+                                name=name,
+                                num_seqs=info.get("num_seqs", 0),
+                                split_file=f"{name}.h5",
+                            )
 
         # Parse targets
         targets = []
@@ -185,7 +213,7 @@ class DatasetMetadata:
                 )
 
         return cls(
-            version=data.get("version", "2.0"),
+            version=version,
             name=data.get("name", ""),
             created=data.get("created", ""),
             genome=genome,
@@ -231,8 +259,7 @@ class DatasetMetadata:
         for name, split in self.splits.items():
             result["sequences"]["splits"][name] = {
                 "num_seqs": split.num_seqs,
-                "coordinate_file": split.coordinate_file,
-                "target_file": split.target_file,
+                "split_file": split.split_file,
             }
 
         for target in self.targets:

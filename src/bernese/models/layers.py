@@ -377,9 +377,7 @@ class StochasticShift(keras.layers.Layer):
 
         # Random shift
         if self.symmetric:
-            shift = keras.random.uniform(
-                (), minval=-self.shift_max, maxval=self.shift_max + 1
-            )
+            shift = keras.random.uniform((), minval=-self.shift_max, maxval=self.shift_max + 1)
             shift = ops.cast(shift, "int32")
         else:
             shift = keras.random.uniform((), minval=0, maxval=self.shift_max + 1)

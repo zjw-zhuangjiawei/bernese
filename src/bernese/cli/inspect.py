@@ -24,14 +24,13 @@ def inspect(
         bernese inspect data_dir/
         bernese inspect data_dir/ -v
     """
-    # Check for manifest.json or sequences.h5
+    # Check for manifest.json (v2.0+ format required)
     manifest_path = data_dir / "manifest.json"
-    sequences_h5 = data_dir / "sequences.h5"
-    
-    if not manifest_path.exists() and not sequences_h5.exists():
+
+    if not manifest_path.exists():
         raise typer.BadParameter(
             f"Directory '{data_dir}' does not contain a valid dataset. "
-            "Expected manifest.json (v2 format) or sequences.h5 (legacy format)."
+            "Expected manifest.json (v2.0+ format)."
         )
 
     # Create backend to load metadata
@@ -39,9 +38,7 @@ def inspect(
         backend = HDF5Backend(data_dir)
         metadata = backend.metadata
     except Exception as e:
-        raise typer.BadParameter(
-            f"Failed to load dataset from '{data_dir}': {e}"
-        )
+        raise typer.BadParameter(f"Failed to load dataset from '{data_dir}': {e}")
 
     # Print header
     print(f"Dataset: {data_dir}")
@@ -76,17 +73,14 @@ def inspect(
     if metadata.targets:
         print("\nTarget Tracks:")
         for i, target in enumerate(metadata.targets):
-            print(f"  {i+1}. {target.name}")
-            if verbose:
-                print(f"     File: {target.file}")
-                if target.clip:
-                    print(f"     Clip: {target.clip}")
+            print(f"  {i + 1}. {target.name}")
+            if verbose and target.clip:
+                print(f"     Clip: {target.clip}")
 
     # Genome information
     if metadata.genome:
         print("\nGenome Information:")
         print(f"  Name: {metadata.genome.name}")
-        print(f"  FASTA: {metadata.genome.fasta_path}")
 
     # Verbose: show sample coordinates
     if verbose:

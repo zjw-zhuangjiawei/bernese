@@ -7,151 +7,55 @@ model for regulatory activity prediction, ported from the TensorFlow baskerville
 implementation.
 """
 
-from dataclasses import dataclass, field
-from typing import Optional, List, Any
+from typing import Optional, List
 
 import keras
+from keras import KerasTensor
 
-from bernese.models import blocks
 from bernese.models import layers as custom_layers
+from bernese.models.config import SeqNNConfig, BlockConfig
 
+# Import all block configs for type-safe dispatch
+from bernese.models.config import (
+    ConvBlockConfig,
+    ConvNACConfig,
+    ConvDNAConfig,
+    ConvBlock2DConfig,
+    ConvTowerConfig,
+    ConvTowerNACConfig,
+    ResTowerConfig,
+    DenseBlockConfig,
+    FinalConfig,
+    DilatedResidualConfig,
+    DilatedResidual2DConfig,
+    OneToTwoConfig,
+    ConcatDist2DConfig,
+    Symmetrize2DConfig,
+    UpperTriConfig,
+    Cropping2DConfig,
+    SqueezeExciteConfig,
+)
 
-@dataclass
-class SeqNNConfig:
-    """Configuration for SeqNN model.
-
-    Attributes:
-        seq_length: Input sequence length
-        seq_depth: Number of channels (4 for DNA)
-        trunk: List of block configurations for the model trunk
-        heads: List of head configurations (list of lists of block dicts)
-        num_targets: Number of prediction targets
-        augment_rc: Whether to use reverse complement augmentation
-        augment_shift: List of shift amounts for augmentation
-        strand_pair: List of strand pairs for merging predictions
-        activation: Default activation function
-        l2_scale: L2 regularization weight
-        l1_scale: L1 regularization weight
-        kernel_initializer: Weight initialization
-        norm_type: Normalization type
-        bn_momentum: BatchNorm momentum
-        verbose: Whether to print model summary
-        diagonal_offset: Diagonal offset for Hi-C predictions
-    """
-
-    # Required fields
-    seq_length: int = 1344
-    seq_depth: int = 4
-    trunk: List[dict] = field(default_factory=list)
-    heads: List[List[dict]] = field(default_factory=list)
-    num_targets: int = 1
-
-    # Augmentation
-    augment_rc: bool = False
-    augment_shift: List[int] = field(default_factory=lambda: [0])
-    strand_pair: List = field(default_factory=list)
-
-    # Regularization and initialization
-    activation: str = "relu"
-    l2_scale: float = 0
-    l1_scale: float = 0
-    kernel_initializer: str = "he_normal"
-    norm_type: Optional[str] = None
-    bn_momentum: float = 0.99
-
-    # Output control
-    verbose: bool = True
-    diagonal_offset: int = 0
-
-    def __post_init__(self):
-        """Validate and normalize configuration."""
-        # Handle augment_shift as int (legacy format)
-        if isinstance(self.augment_shift, int):
-            self.augment_shift = [self.augment_shift]
-
-        # Normalize trunk - ensure it's a list of dicts
-        if not self.trunk:
-            self.trunk = [
-                {
-                    "name": "conv_tower",
-                    "filters_init": 48,
-                    "filters_end": 512,
-                    "repeat": 6,
-                    "kernel_size": 3,
-                    "norm_type": "batch",
-                    "activation": "relu",
-                }
-            ]
-
-        # Normalize heads - ensure it's list of lists
-        if not self.heads:
-            self.heads = [
-                [
-                    {
-                        "name": "conv_block",
-                        "filters": 256,
-                        "kernel_size": 1,
-                        "norm_type": "batch",
-                        "activation": "relu",
-                    },
-                    {
-                        "name": "conv_block",
-                        "filters": 256,
-                        "kernel_size": 1,
-                        "norm_type": "batch",
-                        "activation": "relu",
-                    },
-                    {"name": "final", "units": self.num_targets, "activation": "linear"},
-                ]
-            ]
-        elif isinstance(self.heads, list) and len(self.heads) > 0:
-            # Check if it's a list of dicts (single head) or list of lists
-            if isinstance(self.heads[0], dict):
-                self.heads = [self.heads]
-
-        # Extend strand_pair if needed
-        while len(self.strand_pair) < len(self.heads):
-            self.strand_pair.append(None)
-
-    @classmethod
-    def from_dict(cls, params: dict) -> "SeqNNConfig":
-        """Create config from dictionary, handling None values.
-
-        Args:
-            params: Dictionary of parameters.
-
-        Returns:
-            SeqNNConfig instance.
-        """
-        # Filter out None values to use defaults
-        filtered = {k: v for k, v in params.items() if v is not None}
-
-        # Handle legacy 'head_hic' as 'heads'
-        if "head_hic" in filtered and "heads" not in filtered:
-            filtered["heads"] = filtered.pop("head_hic")
-
-        # Filter to only known fields
-        known_fields = {
-            "seq_length",
-            "seq_depth",
-            "trunk",
-            "heads",
-            "num_targets",
-            "augment_rc",
-            "augment_shift",
-            "strand_pair",
-            "activation",
-            "l2_scale",
-            "l1_scale",
-            "kernel_initializer",
-            "norm_type",
-            "bn_momentum",
-            "verbose",
-            "diagonal_offset",
-        }
-        filtered = {k: v for k, v in filtered.items() if k in known_fields}
-
-        return cls(**filtered)
+# Import block functions
+from bernese.models.blocks import (
+    conv_block,
+    conv_nac,
+    conv_dna,
+    conv_block_2d,
+    conv_tower,
+    conv_tower_nac,
+    res_tower,
+    dense_block,
+    final,
+    dilated_residual,
+    dilated_residual_2d,
+    one_to_two,
+    symmetrize_2d,
+    concat_dist_2d,
+    cropping_2d,
+    squeeze_excite,
+    upper_tri,
+)
 
 
 class SeqNNBuilder:
@@ -165,14 +69,14 @@ class SeqNNBuilder:
         """Initialize builder with configuration.
 
         Args:
-            config: SeqNN configuration.
+            config: SeqNN configuration (Pydantic model).
         """
         self.config = config
         self.sequence = None
         self.trunk_output = None
         self.reverse_bool = None
         self.preds_triu = False
-        self.reprs = []
+        self.reprs: list[KerasTensor] = []
 
     def build(self) -> "SeqNN":
         """Build the complete SeqNN model.
@@ -261,84 +165,76 @@ class SeqNNBuilder:
         Returns:
             Trunk output tensor.
         """
-        for block_params in self.config.trunk:
-            current = self._build_block(current, block_params)
+        for block_config in self.config.trunk:
+            current = self._build_block(current, block_config)
 
         return current
 
-    def _build_block(self, current: keras.Layer, block_params: dict) -> keras.Layer:
-        """Build a single block.
+    def _build_block(self, current: keras.Layer, block_config: BlockConfig) -> keras.Layer:
+        """Build a single block with type-safe dispatch.
+
+        Uses isinstance pattern matching for compile-time type safety.
+        Each block type is matched to its corresponding function.
 
         Args:
             current: Input tensor.
-            block_params: Block configuration dictionary.
+            block_config: Block configuration (Pydantic model).
 
         Returns:
             Block output tensor.
         """
-        block_name = block_params.get("name", "")
-
         # Track upper_tri for Hi-C predictions
-        self.preds_triu = self.preds_triu or block_name == "upper_tri"
+        self.preds_triu = self.preds_triu or block_config.name == "upper_tri"
 
-        # Determine block function
-        block_func = None
-        if block_name and block_name[0].isupper():
-            if block_name in blocks.keras_func:
-                block_func = blocks.keras_func[block_name]
-        elif block_name in blocks.name_func:
-            block_func = blocks.name_func[block_name]
+        # Type-safe dispatch using isinstance pattern matching
+        match block_config:
+            # Convolution blocks
+            case ConvBlockConfig() as cfg:
+                return conv_block(current, cfg)
+            case ConvNACConfig() as cfg:
+                return conv_nac(current, cfg)
+            case ConvDNAConfig() as cfg:
+                return conv_dna(current, cfg)
+            case ConvBlock2DConfig() as cfg:
+                return conv_block_2d(current, cfg)
 
-        # Get allowed parameters for this block
-        allowed_params = set()
-        if block_func is not None:
-            try:
-                import inspect
+            # Tower blocks (pass reprs)
+            case ConvTowerConfig() as cfg:
+                return conv_tower(current, cfg, self.reprs)
+            case ConvTowerNACConfig() as cfg:
+                return conv_tower_nac(current, cfg, self.reprs)
+            case ResTowerConfig() as cfg:
+                return res_tower(current, cfg, self.reprs)
 
-                if hasattr(block_func, "__code__"):
-                    allowed_params = set(block_func.__code__.co_varnames)
-                elif hasattr(block_func, "__init__") and hasattr(block_func.__init__, "__code__"):
-                    allowed_params = set(block_func.__init__.__code__.co_varnames)
-            except Exception:
-                pass
+            # Dense blocks
+            case DenseBlockConfig() as cfg:
+                return dense_block(current, cfg)
+            case FinalConfig() as cfg:
+                return final(current, cfg)
 
-        # Start with block-specific params
-        block_args = {k: v for k, v in block_params.items() if k != "name"}
+            # Dilated blocks
+            case DilatedResidualConfig() as cfg:
+                return dilated_residual(current, cfg)
+            case DilatedResidual2DConfig() as cfg:
+                return dilated_residual_2d(current, cfg)
 
-        # Add global defaults only if they're in allowed params
-        global_vars = [
-            "activation",
-            "batch_norm",
-            "bn_momentum",
-            "norm_type",
-            "l2_scale",
-            "l1_scale",
-            "padding",
-            "kernel_initializer",
-        ]
-        for gv in global_vars:
-            if gv in allowed_params:
-                gv_value = getattr(self.config, gv, None)
-                if gv_value is not None and gv not in block_args:
-                    block_args[gv] = gv_value
+            # 2D operation blocks
+            case OneToTwoConfig() as cfg:
+                return one_to_two(current, cfg)
+            case ConcatDist2DConfig() as cfg:
+                return concat_dist_2d(current, cfg)
+            case Symmetrize2DConfig() as cfg:
+                return symmetrize_2d(current, cfg)
+            case UpperTriConfig() as cfg:
+                return upper_tri(current, cfg)
+            case Cropping2DConfig() as cfg:
+                return cropping_2d(current, cfg)
+            case SqueezeExciteConfig() as cfg:
+                return squeeze_excite(current, cfg)
 
-        # Save representations for towers
-        if "tower" in block_name:
-            block_args["reprs"] = self.reprs
-
-        # Execute block
-        if block_func is not None and block_name and block_name[0].isupper():
-            current = block_func(**block_args)(current)
-        elif block_name in blocks.name_func:
-            block_func = blocks.name_func[block_name]
-            if block_func is not None:
-                current = block_func(current, **block_args)
-            else:
-                raise ValueError(f"Block {block_name} not implemented")
-        else:
-            raise ValueError(f"Unknown block: {block_name}")
-
-        return current
+            # Unknown block type
+            case _:
+                raise ValueError(f"Unknown block type: {type(block_config).__name__}")
 
     def _build_trunk_model(self):
         """Build trunk model."""
@@ -359,9 +255,8 @@ class SeqNNBuilder:
             current = self.trunk_output
 
             # Build blocks for this head
-            for block_params in head:
-                if isinstance(block_params, dict):
-                    current = self._build_block(current, block_params)
+            for block_config in head:
+                current = self._build_block(current, block_config)
 
             # Get strand pair for this head
             strand_pair = self.config.strand_pair[hi] if hi < len(self.config.strand_pair) else None
@@ -404,13 +299,20 @@ class SeqNN:
     for clean separation of concerns.
 
     Args:
-        config: SeqNNConfig instance or dict of parameters.
+        config: SeqNNConfig instance (Pydantic model).
     """
 
-    def __init__(self, config: SeqNNConfig | dict[str, Any]):
-        # Handle dict input
-        if isinstance(config, dict):
-            config = SeqNNConfig.from_dict(config)
+    def __init__(self, config: SeqNNConfig):
+        """Initialize SeqNN with configuration.
+
+        Args:
+            config: SeqNNConfig Pydantic model instance.
+        """
+        if not isinstance(config, SeqNNConfig):
+            raise TypeError(
+                f"config must be a SeqNNConfig instance, got {type(config).__name__}. "
+                f"Use SeqNNConfig.from_json() to load from file."
+            )
 
         # Build model using builder
         builder = SeqNNBuilder(config)
@@ -635,22 +537,8 @@ class SeqNN:
         return f"SeqNN(seq_length={self.seq_length}, num_targets={self.get_num_targets()})"
 
 
-def create_seqnn(params: dict[str, Any]) -> SeqNN:
-    """Factory function to create a SeqNN model.
-
-    Args:
-        params: Model configuration dictionary.
-
-    Returns:
-        SeqNN model instance.
-    """
-    return SeqNN(params)
-
-
 # Export classes and functions
 __all__ = [
     "SeqNN",
-    "SeqNNConfig",
     "SeqNNBuilder",
-    "create_seqnn",
 ]

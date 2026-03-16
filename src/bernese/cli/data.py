@@ -19,15 +19,21 @@ prepare_app = typer.Typer(help="Prepare genomic data for training SeqNN models."
 @prepare_app.command(name="hic")
 def hic(
     fasta_file: Path = typer.Argument(..., exists=True, help="Genome FASTA file"),
-    targets_file: Path = typer.Argument(..., exists=True, help="Targets file (TSV with target information)"),
+    targets_file: Path = typer.Argument(
+        ..., exists=True, help="Targets file (TSV with target information)"
+    ),
     out_dir: Path = typer.Option("data_out", "-o", help="Output directory"),
     seq_length: int = typer.Option(131072, "-l", "--seq_length", help="Sequence length in bp"),
     crop_bp: int = typer.Option(0, "-c", "--crop_bp", help="Crop bp from each end"),
     pool_width: int = typer.Option(128, "-w", "--pool_width", help="Pool width for targets"),
-    diagonal_offset: int = typer.Option(2, "-d", "--diagonal_offset", help="Diagonal offset for Hi-C"),
+    diagonal_offset: int = typer.Option(
+        2, "-d", "--diagonal_offset", help="Diagonal offset for Hi-C"
+    ),
     test_pct: float = typer.Option(0.05, "--test_pct", help="Test set proportion"),
     valid_pct: float = typer.Option(0.05, "--valid_pct", help="Validation set proportion"),
-    stride_train: float = typer.Option(1.0, "--stride_train", help="Stride for training sequences (fraction or bp)"),
+    stride_train: float = typer.Option(
+        1.0, "--stride_train", help="Stride for training sequences (fraction or bp)"
+    ),
     stride_test: float = typer.Option(1.0, "--stride_test", help="Stride for test/valid sequences"),
     sample: float = typer.Option(1.0, "--sample", help="Down-sample proportion"),
     seed: int = typer.Option(44, "--seed", help="Random seed"),
@@ -61,15 +67,21 @@ def hic(
 @prepare_app.command(name="bigwig")
 def bigwig(
     fasta_file: Path = typer.Argument(..., exists=True, help="Genome FASTA file"),
-    targets_file: Path = typer.Argument(..., exists=True, help="Targets file (TSV with target information)"),
+    targets_file: Path = typer.Argument(
+        ..., exists=True, help="Targets file (TSV with target information)"
+    ),
     out_dir: Path = typer.Option("data_out", "-o", help="Output directory"),
     seq_length: int = typer.Option(131072, "-l", "--seq_length", help="Sequence length in bp"),
     crop_bp: int = typer.Option(0, "-c", "--crop_bp", help="Crop bp from each end"),
     pool_width: int = typer.Option(128, "-w", "--pool_width", help="Pool width for targets"),
-    aggregation: str = typer.Option("mean", "-a", "--aggregation", help="Aggregation method: mean, sum, max, min"),
+    aggregation: str = typer.Option(
+        "mean", "-a", "--aggregation", help="Aggregation method: mean, sum, max, min"
+    ),
     test_pct: float = typer.Option(0.05, "--test_pct", help="Test set proportion"),
     valid_pct: float = typer.Option(0.05, "--valid_pct", help="Validation set proportion"),
-    stride_train: float = typer.Option(1.0, "--stride_train", help="Stride for training sequences (fraction or bp)"),
+    stride_train: float = typer.Option(
+        1.0, "--stride_train", help="Stride for training sequences (fraction or bp)"
+    ),
     stride_test: float = typer.Option(1.0, "--stride_test", help="Stride for test/valid sequences"),
     sample: float = typer.Option(1.0, "--sample", help="Down-sample proportion"),
     seed: int = typer.Option(44, "--seed", help="Random seed"),
@@ -147,7 +159,9 @@ def _run_preparation(
 
     # Create output directory
     if out_dir.exists() and (out_dir / "manifest.json").exists():
-        raise typer.BadParameter(f"Output directory {out_dir} already has manifest.json. Remove or use a different directory.")
+        raise typer.BadParameter(
+            f"Output directory {out_dir} already has manifest.json. Remove or use a different directory."
+        )
 
     # Run preparation
     print(f"Preparing dataset...")

@@ -3,10 +3,9 @@
 """Training command-line interface for bernese.
 
 This module provides the 'bernese train' command for training SeqNN models.
-Based on hound_train.py from Basenji/Baskerville.
+Uses fully type-safe Pydantic TrainerConfig.
 """
 
-import json
 import os
 import random
 import shutil
@@ -17,9 +16,13 @@ import numpy as np
 import torch
 import typer
 
-from bernese.models import create_seqnn
+from bernese.models import SeqNN, SeqNNConfig
 from bernese.data import create_data_loaders
-from bernese.training import create_trainer_from_config
+from bernese.training import (
+    TrainerConfig,
+    TrainerBuilder,
+    create_trainer_from_config,
+)
 
 
 def set_seed(seed: int):
@@ -33,25 +36,13 @@ def set_seed(seed: int):
 
 def train(
     model_file: Path = typer.Argument(..., exists=True, help="Path to model.json"),
-    train_file: Path = typer.Argument(..., exists=True, help="Path to train.json"),
+    train_file: Path = typer.Argument(
+        ..., exists=True, help="Path to train.json (Pydantic format)"
+    ),
     data_dirs: List[Path] = typer.Argument(..., help="Training data directory(ies)"),
     out_dir: Path = typer.Option("train_out", "-o", help="Output directory for checkpoints"),
     epochs: Optional[int] = typer.Option(
-        None, "--epochs", help="Number of training epochs (default: from config)"
-    ),
-    batch_size: Optional[int] = typer.Option(
-        None, "--batch_size", help="Batch size (default: from config)"
-    ),
-    lr: Optional[float] = typer.Option(
-        None, "--lr", "--learning_rate", help="Learning rate (default: from config)"
-    ),
-    optimizer: Optional[str] = typer.Option(
-        None, "--optimizer", help="Optimizer type: adam, adamw, or sgd (default: from config)"
-    ),
-    loss: Optional[str] = typer.Option(
-        None,
-        "--loss",
-        help="Loss function: mse, bce, poisson, poisson_kl, poisson_multinomial, or mse_udot (default: from config)",
+        None, "--epochs", help="Number of training epochs (overrides config)"
     ),
     device: str = typer.Option(
         "cuda" if torch.cuda.is_available() else "cpu", "-d", "--device", help="Device to train on"
@@ -67,7 +58,7 @@ def train(
 
     Example:
         bernese train model.json train.json data_dir/ -o train_out
-        bernese train model.json train.json data_dir/ --epochs 100 --lr 0.001
+        bernese train model.json train.json data_dir/ --epochs 100
     """
     # Set random seed
     set_seed(seed)
@@ -80,28 +71,21 @@ def train(
         shutil.copy(model_file, Path(out_dir) / "model.json")
         shutil.copy(train_file, Path(out_dir) / "train.json")
 
-    # Load model configuration
-    with open(model_file, "r") as f:
-        params_model = json.load(f)
+    # Load model configuration using Pydantic
+    model_config = SeqNNConfig.from_json(str(model_file))
 
-    # Load training configuration
-    with open(train_file, "r") as f:
-        params_train = json.load(f)
+    # Load training configuration using Pydantic
+    train_config = TrainerConfig.from_json(str(train_file))
 
     # Override config with command-line args
-    if batch_size is not None:
-        params_train["batch_size"] = batch_size
-    if lr is not None:
-        params_train["learning_rate"] = lr
-    if optimizer is not None:
-        params_train["optimizer"] = optimizer
-    if loss is not None:
-        params_train["loss"] = loss
     if epochs is not None:
-        params_train["train_epochs_max"] = epochs
+        train_config.max_epochs = epochs
 
-    # Get batch size
-    batch_size = params_train.get("batch_size", 64)
+    # Override device if specified
+    train_config.device = device
+
+    # Get batch size from config
+    batch_size = train_config.batch_size
 
     # Create data loaders
     print(f"Loading data from: {[str(d) for d in data_dirs]}")
@@ -119,9 +103,12 @@ def train(
         train_loaders.append(train_loader)
         val_loaders.append(val_loader)
 
-    # Use first data dir for model config
+    # Get num_targets from dataset
     num_targets = train_loaders[0].dataset.num_targets
-    params_model["num_targets"] = num_targets
+
+    # Update config with num_targets
+    train_config.num_targets = num_targets
+    model_config.num_targets = num_targets
 
     # Print model info
     print(f"Number of targets: {num_targets}")
@@ -130,21 +117,20 @@ def train(
 
     # Create model
     print("Creating model...")
-    model = create_seqnn(params_model)
+    model = SeqNN(model_config)
 
-    # Create trainer
+    # Create trainer using Pydantic config
     print("Creating trainer...")
     trainer = create_trainer_from_config(
         model=model,
         train_loader=train_loaders if len(train_loaders) > 1 else train_loaders[0],
         val_loader=val_loaders if len(val_loaders) > 1 else val_loaders[0],
-        config=params_train,
+        config=train_config,
         device=device,
     )
 
     # Train
-    num_epochs = epochs or params_train.get("train_epochs_max", 100)
-    print(f"\nStarting training for {num_epochs} epochs...")
+    print(f"\nStarting training for {train_config.max_epochs} epochs...")
     print(f"Output directory: {out_dir}")
     print("-" * 60)
 

@@ -2,58 +2,304 @@
 # Licensed under the Apache License, Version 2.0
 """Comprehensive training loop and utilities for SeqNN models.
 
-This module provides a Trainer class that combines:
-- Keras 3 SeqNN model for forward pass
+This module provides:
+- TrainerConfig: Fully typed Pydantic configuration
+- TrainerBuilder: Builder class for constructing Trainer
+- Trainer: Comprehensive training loop with Keras 3 + PyTorch DataLoader
+
+This module implements a hybrid approach:
+- Keras 3 model for forward pass and weight updates
 - PyTorch DataLoader for data iteration
-- PyTorch losses and metrics for training evaluation
+- PyTorch losses and metrics for evaluation
 """
 
 import itertools
 import json
 import os
 from pathlib import Path
-from typing import TypedDict, Optional
+from typing import Optional
 
 import numpy as np
 
 import keras
+import torch
+import torch.nn as nn
 from torch.utils.data import DataLoader
 
 from bernese.models.seqnn import SeqNN
-from bernese.metrics.losses import get_loss_function
-from bernese.metrics.metrics import get_metric
+from bernese.metrics.losses import (
+    MSEUDot,
+    PoissonKL,
+    PoissonMultinomial,
+    get_loss_function as get_keras_loss,
+    _MSELoss,
+    _PoissonLoss,
+    _BCELoss,
+)
+from bernese.metrics.metrics import (
+    PearsonR,
+    R2,
+    SeqAUC,
+    get_metric,
+)
+
+# Import Pydantic configurations
+from bernese.training.config import (
+    TrainerConfig,
+    OptimizerConfig,
+    LossConfig,
+    MetricConfig,
+    SchedulerConfig,
+    EarlyStoppingConfig,
+    CheckpointConfig,
+    # Optimizer configs
+    SGDConfig,
+    AdamConfig,
+    AdamWConfig,
+    # Loss configs
+    MSELossConfig,
+    BCELossConfig,
+    PoissonLossConfig,
+    MSEUDotLossConfig,
+    PoissonKLLossConfig,
+    PoissonMultinomialLossConfig,
+    # Metric configs
+    PearsonRMetricConfig,
+    R2MetricConfig,
+    AUROCMetricConfig,
+    AUPRCMetricConfig,
+    # Scheduler configs
+    ConstantSchedulerConfig,
+    ExponentialSchedulerConfig,
+    CyclicalSchedulerConfig,
+    WarmupSchedulerConfig,
+)
 
 
-class TrainConfig(TypedDict, total=False):
-    """Training configuration matching train.json fields.
+class TrainerBuilder:
+    """Builder class for constructing Trainer with type-safe configuration.
 
-    Attributes:
-        batch_size: Training batch size
-        optimizer: Optimizer type (sgd, adam, adamw)
-        learning_rate: Initial learning rate
-        momentum: Momentum for SGD optimizer
-        weight_decay: Weight decay for regularization
-        loss: Loss function (mse, bce, poisson, mse_udot)
-        patience: Early stopping patience (epochs)
-        clip_norm: Gradient clipping norm (0 = disabled)
-        train_epochs_max: Maximum training epochs
-        eval_interval: Validation evaluation interval (epochs)
-        save_interval: Checkpoint save interval (epochs)
-        metrics: List of metrics to compute (pearsonr, r2, auroc, auprc)
+    This class handles the trainer construction logic, separating construction
+    concerns from the trainer itself. Uses Pydantic config for validation.
+
+    Example:
+        >>> config = TrainerConfig.from_json("train_config.json")
+        >>> builder = TrainerBuilder(config)
+        >>> trainer = builder.with_model(model).build()
     """
 
-    batch_size: int
-    optimizer: str
-    learning_rate: float
-    momentum: float
-    weight_decay: float
-    loss: str
-    patience: int
-    clip_norm: float
-    train_epochs_max: int
-    eval_interval: int
-    save_interval: int
-    metrics: list[str]
+    def __init__(self, config: TrainerConfig):
+        """Initialize builder with configuration.
+
+        Args:
+            config: TrainerConfig Pydantic model instance.
+        """
+        if not isinstance(config, TrainerConfig):
+            raise TypeError(
+                f"config must be a TrainerConfig instance, got {type(config).__name__}. "
+                f"Use TrainerConfig.from_json() to load from file."
+            )
+
+        self.config = config
+        self.model: Optional[SeqNN] = None
+        self.train_loader: Optional[DataLoader | list[DataLoader]] = None
+        self.val_loader: Optional[DataLoader | list[DataLoader]] = None
+
+    def with_model(self, model: SeqNN) -> "TrainerBuilder":
+        """Set the model to train.
+
+        Args:
+            model: SeqNN model instance.
+
+        Returns:
+            Self for method chaining.
+        """
+        self.model = model
+        return self
+
+    def with_train_loader(self, loader: DataLoader | list[DataLoader]) -> "TrainerBuilder":
+        """Set the training data loader.
+
+        Args:
+            loader: Training data loader or list of loaders.
+
+        Returns:
+            Self for method chaining.
+        """
+        self.train_loader = loader
+        return self
+
+    def with_val_loader(self, loader: DataLoader | list[DataLoader]) -> "TrainerBuilder":
+        """Set the validation data loader.
+
+        Args:
+            loader: Validation data loader or list of loaders.
+
+        Returns:
+            Self for method chaining.
+        """
+        self.val_loader = loader
+        return self
+
+    def build(self) -> "Trainer":
+        """Build the complete Trainer.
+
+        Returns:
+            Configured Trainer instance.
+
+        Raises:
+            ValueError: If required components are not set.
+        """
+        if self.model is None:
+            raise ValueError("Model must be set before building Trainer")
+        if self.train_loader is None:
+            raise ValueError("Training data loader must be set")
+        if self.val_loader is None:
+            raise ValueError("Validation data loader must be set")
+
+        # Build components
+        optimizer = self._build_optimizer()
+        loss_fn = self._build_loss()
+        metrics = self._build_metrics()
+        scheduler = self._build_scheduler()
+
+        # Create trainer
+        return Trainer(
+            model=self.model,
+            train_loader=self.train_loader,
+            val_loader=self.val_loader,
+            optimizer=optimizer,
+            loss_fn=loss_fn,
+            metrics=metrics,
+            scheduler=scheduler,
+            config=self.config,
+            device=self.config.device,
+        )
+
+    def _build_optimizer(self) -> keras.optimizers.Optimizer:
+        """Build optimizer with type-safe dispatch and gradient clipping.
+
+        Returns:
+            Keras optimizer instance with gradient clipping enabled.
+        """
+        # Get gradient clipping norm from config (default to 1.0 for stability)
+        clipnorm = self.config.grad_clip_norm if self.config.grad_clip_norm > 0 else None
+
+        match self.config.optimizer:
+            case SGDConfig() as cfg:
+                return keras.optimizers.SGD(
+                    learning_rate=cfg.learning_rate,
+                    momentum=cfg.momentum,
+                    weight_decay=cfg.weight_decay,
+                    clipnorm=clipnorm,
+                )
+            case AdamConfig() as cfg:
+                return keras.optimizers.Adam(
+                    learning_rate=cfg.learning_rate,
+                    weight_decay=cfg.weight_decay,
+                    beta_1=cfg.beta_1,
+                    beta_2=cfg.beta_2,
+                    epsilon=cfg.epsilon,
+                    clipnorm=clipnorm,
+                )
+            case AdamWConfig() as cfg:
+                return keras.optimizers.AdamW(
+                    learning_rate=cfg.learning_rate,
+                    weight_decay=cfg.weight_decay,
+                    beta_1=cfg.beta_1,
+                    beta_2=cfg.beta_2,
+                    epsilon=cfg.epsilon,
+                    clipnorm=clipnorm,
+                )
+            case _:
+                raise ValueError(
+                    f"Unknown optimizer config: {type(self.config.optimizer).__name__}"
+                )
+
+    def _build_loss(self):
+        """Build loss function with type-safe dispatch.
+
+        Returns:
+            Keras 3 compatible loss function.
+        """
+        match self.config.loss:
+            case MSELossConfig():
+                return _MSELoss(reduction="sum_over_batch_size")
+            case BCELossConfig() as cfg:
+                return _BCELoss(reduction="sum_over_batch_size", pos_weight=cfg.pos_weight)
+            case PoissonLossConfig() as cfg:
+                return _PoissonLoss(reduction="sum_over_batch_size")
+            case MSEUDotLossConfig() as cfg:
+                return MSEUDot(udot_weight=cfg.udot_weight, reduction="sum_over_batch_size")
+            case PoissonKLLossConfig() as cfg:
+                return PoissonKL(
+                    kl_weight=cfg.kl_weight, epsilon=cfg.epsilon, reduction="sum_over_batch_size"
+                )
+            case PoissonMultinomialLossConfig() as cfg:
+                return PoissonMultinomial(
+                    total_weight=cfg.total_weight,
+                    weight_range=cfg.weight_range,
+                    weight_exp=cfg.weight_exp,
+                    epsilon=cfg.epsilon,
+                    reduction="sum_over_batch_size",
+                )
+            case _:
+                raise ValueError(f"Unknown loss config: {type(self.config.loss).__name__}")
+
+    def _build_metrics(self) -> dict[str, nn.Module]:
+        """Build metrics dictionary with type-safe dispatch.
+
+        Returns:
+            Dictionary of metric modules.
+        """
+        metrics = {}
+        num_targets = self.config.num_targets
+
+        for metric_cfg in self.config.metrics:
+            match metric_cfg:
+                case PearsonRMetricConfig() as cfg:
+                    metrics["pearsonr"] = PearsonR(num_targets, cfg.summarize)
+                case R2MetricConfig() as cfg:
+                    metrics["r2"] = R2(num_targets, cfg.summarize)
+                case AUROCMetricConfig() as cfg:
+                    metrics["auroc"] = SeqAUC("ROC", cfg.summarize)
+                case AUPRCMetricConfig() as cfg:
+                    metrics["auprc"] = SeqAUC("PR", cfg.summarize)
+                case _:
+                    raise ValueError(f"Unknown metric config: {type(metric_cfg).__name__}")
+
+        return metrics
+
+    def _build_scheduler(self) -> Optional[keras.optimizers.schedules.LearningRateSchedule]:
+        """Build learning rate scheduler with type-safe dispatch.
+
+        Returns:
+            Keras learning rate scheduler or None.
+        """
+        if self.config.scheduler is None:
+            return None
+
+        # Get base learning rate from optimizer config
+        base_lr = self.config.optimizer.learning_rate
+
+        match self.config.scheduler:
+            case ConstantSchedulerConfig():
+                return base_lr
+            case ExponentialSchedulerConfig() as cfg:
+                return keras.optimizers.schedules.ExponentialDecay(
+                    initial_learning_rate=base_lr,
+                    decay_rate=cfg.decay_rate,
+                    decay_steps=cfg.decay_steps,
+                    staircase=cfg.staircase,
+                )
+            case CyclicalSchedulerConfig() as cfg:
+                # Keras doesn't have built-in cyclical scheduler, use custom callback
+                return None
+            case WarmupSchedulerConfig() as cfg:
+                # Warmup will be handled by a callback
+                return None
+            case _:
+                return None
 
 
 class Trainer:
@@ -65,11 +311,15 @@ class Trainer:
     - PyTorch losses and metrics for evaluation
 
     Args:
-        model: The SeqNN model to train
-        train_loader: Training data loader (or list of loaders for multi-dataset)
-        val_loader: Validation data loader (or list of loaders)
-        config: Training configuration dictionary
-        device: Device to train on (cuda/cpu)
+        model: The SeqNN model to train.
+        train_loader: Training data loader (or list of loaders for multi-dataset).
+        val_loader: Validation data loader (or list of loaders).
+        optimizer: Keras optimizer instance.
+        loss_fn: PyTorch loss module.
+        metrics: Dictionary of PyTorch metric modules.
+        scheduler: Optional Keras learning rate scheduler.
+        config: TrainerConfig instance.
+        device: Device to train on (cuda/cpu).
     """
 
     def __init__(
@@ -77,27 +327,27 @@ class Trainer:
         model: SeqNN,
         train_loader: DataLoader | list[DataLoader],
         val_loader: DataLoader | list[DataLoader],
-        config: TrainConfig,
+        optimizer: keras.optimizers.Optimizer,
+        loss_fn: nn.Module,
+        metrics: dict[str, nn.Module],
+        scheduler: Optional[keras.optimizers.schedules.LearningRateSchedule],
+        config: TrainerConfig,
         device: str = "cuda",
     ):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
+        self.optimizer = optimizer
+        self.loss_fn = loss_fn
+        self.metrics = metrics
+        self.scheduler = scheduler
         self.config = config
         self.device = device
 
         # Get num_targets from model
         self.num_targets = model.get_num_targets()
 
-        # Create optimizer
-        self.optimizer = self._create_optimizer()
-
-        # Create loss function (PyTorch)
-        self.loss_fn = get_loss_function(config.get("loss", "mse"))
-
-        # Create metrics (PyTorch)
-        self.metrics = self._create_metrics()
-
+        # Compile Keras model
         self.model.model.compile(optimizer=self.optimizer, loss=self.loss_fn)
 
         # Training state
@@ -109,63 +359,24 @@ class Trainer:
             "val_loss": [],
         }
 
-    def _create_optimizer(self) -> keras.optimizers.Optimizer:
-        """Create Keras optimizer from config."""
-        opt_type = self.config.get("optimizer", "adam").lower()
-        lr = self.config.get("learning_rate", 0.001)
-        momentum = self.config.get("momentum", 0.0)
-        weight_decay = self.config.get("weight_decay", 0.0)
-
-        if opt_type == "sgd":
-            return keras.optimizers.SGD(
-                learning_rate=lr,
-                momentum=momentum,
-                weight_decay=weight_decay,
-            )
-        elif opt_type == "adam":
-            return keras.optimizers.Adam(
-                learning_rate=lr,
-                weight_decay=weight_decay,
-            )
-        elif opt_type == "adamw":
-            return keras.optimizers.AdamW(
-                learning_rate=lr,
-                weight_decay=weight_decay,
-            )
-        else:
-            raise ValueError(f"Unknown optimizer: {opt_type}")
-
-    def _create_metrics(self) -> dict:
-        """Create metrics dictionary."""
-        metrics_config = self.config.get("metrics", ["pearsonr"])
-        metrics = {}
-
-        for metric_name in metrics_config:
-            metrics[metric_name] = get_metric(
-                metric_name,
-                num_targets=self.num_targets,
-                summarize=True,
-            )
-
-        return metrics
-
     def fit(
         self,
         epochs: Optional[int] = None,
-        out_dir: str = "train_out",
+        out_dir: Optional[str] = None,
         resume_from: Optional[str] = None,
     ) -> dict:
         """Train the model.
 
         Args:
-            epochs: Number of training epochs (overrides config)
-            out_dir: Output directory for checkpoints
-            resume_from: Checkpoint path to resume from
+            epochs: Number of training epochs (overrides config).
+            out_dir: Output directory for checkpoints (overrides config).
+            resume_from: Checkpoint path to resume from.
 
         Returns:
-            Training history dictionary
+            Training history dictionary.
         """
-        epochs = epochs or self.config.get("train_epochs_max", 100)
+        epochs = epochs or self.config.max_epochs
+        out_dir = out_dir or self.config.output_dir
 
         # Create output directory
         os.makedirs(out_dir, exist_ok=True)
@@ -174,11 +385,16 @@ class Trainer:
         if resume_from:
             self._load_checkpoint(resume_from)
 
+        # Get optimizer and loss info for printing
+        opt_name = type(self.config.optimizer).__name__.replace("Config", "")
+        lr = self.config.optimizer.learning_rate
+        loss_name = type(self.config.loss).__name__.replace("Config", "")
+
         print(f"Starting training for {epochs} epochs...")
-        print(f"Optimizer: {self.config.get('optimizer', 'adam')}")
-        print(f"Learning rate: {self.config.get('learning_rate', 0.001)}")
-        print(f"Loss: {self.config.get('loss', 'mse')}")
-        print(f"Batch size: {self.config.get('batch_size', 64)}")
+        print(f"Optimizer: {opt_name}")
+        print(f"Learning rate: {lr}")
+        print(f"Loss: {loss_name}")
+        print(f"Batch size: {self.config.batch_size}")
         print("-" * 60)
 
         for epoch in range(self.current_epoch, epochs):
@@ -191,7 +407,7 @@ class Trainer:
             print(f"Epoch {epoch + 1}/{epochs} - loss: {train_loss:.6f}")
 
             # Validate
-            if (epoch + 1) % self.config.get("eval_interval", 1) == 0:
+            if (epoch + 1) % self.config.eval_interval == 0:
                 val_loss, val_metrics = self._validate()
                 self.history["val_loss"].append(val_loss)
 
@@ -204,18 +420,23 @@ class Trainer:
                     self.best_val_loss = val_loss
                     self.patience_counter = 0
                     # Save best model
-                    best_path = os.path.join(out_dir, "best_model.weights.h5")
-                    self.model.model.save_weights(best_path)
-                    print(f"  -> Saved best model (val_loss: {val_loss:.6f})")
+                    if self.config.checkpoint.save_best_only:
+                        best_path = os.path.join(out_dir, "best_model.weights.h5")
+                        self.model.model.save_weights(best_path)
+                        print(f"  -> Saved best model (val_loss: {val_loss:.6f})")
                 else:
                     self.patience_counter += 1
 
-                if self.patience_counter >= self.config.get("patience", 10):
+                # Check early stopping
+                if (
+                    self.config.early_stopping
+                    and self.patience_counter >= self.config.early_stopping.patience
+                ):
                     print(f"Early stopping at epoch {epoch + 1}")
                     break
 
             # Periodic checkpoint
-            if (epoch + 1) % self.config.get("save_interval", 1) == 0:
+            if self.config.checkpoint and (epoch + 1) % self.config.checkpoint.save_interval == 0:
                 checkpoint_path = os.path.join(out_dir, f"checkpoint_{epoch + 1}.weights.h5")
                 self.model.model.save_weights(checkpoint_path)
 
@@ -226,19 +447,18 @@ class Trainer:
         """Train for one epoch.
 
         Returns:
-            Average training loss
+            Average training loss.
         """
         self.model.model.trainable = True
 
         # Handle multiple data loaders (multi-dataset)
         loaders = self.train_loader if isinstance(self.train_loader, list) else [self.train_loader]
-        num_loaders = len(loaders)
 
         total_loss = 0.0
         num_batches = 0
 
         # Round-robin through data loaders
-        if num_loaders > 1:
+        if len(loaders) > 1:
             # Multi-dataset: round-robin sampling
             iterators = [iter(loader) for loader in loaders]
 
@@ -285,7 +505,7 @@ class Trainer:
         """Validate the model.
 
         Returns:
-            Tuple of (validation loss, metrics dict)
+            Tuple of (validation loss, metrics dict).
         """
         self.model.model.trainable = False
 
@@ -315,39 +535,27 @@ class Trainer:
                 # Predict
                 preds = self.model.model.predict(X, verbose=0)
 
-                # Compute loss (PyTorch style for metrics)
-                # Convert back to torch for metric computation
-                import torch
-
-                preds_tensor = torch.from_numpy(preds) if isinstance(preds, np.ndarray) else preds
-                targets_tensor = torch.from_numpy(y) if isinstance(y, np.ndarray) else y
-
-                # Compute loss
-                if hasattr(self.loss_fn, "forward"):
-                    loss = self.loss_fn(preds_tensor, targets_tensor).item()
+                # Compute loss using Keras compatible loss function
+                # Keras losses expect (y_true, y_pred) order
+                loss_result = self.loss_fn(y, preds)
+                # Handle both scalar and tensor results
+                if hasattr(loss_result, "item"):
+                    loss = loss_result.item()
                 else:
-                    loss = np.mean((preds - y) ** 2)
+                    loss = float(loss_result)
 
                 total_loss += loss
                 num_batches += 1
 
-                # Collect for metrics
+                # Collect for metrics (convert to torch tensors if needed)
                 all_preds.append(
-                    preds_tensor
-                    if isinstance(preds_tensor, torch.Tensor)
-                    else torch.from_numpy(preds)
+                    torch.from_numpy(preds) if isinstance(preds, np.ndarray) else preds
                 )
-                all_targets.append(
-                    targets_tensor
-                    if isinstance(targets_tensor, torch.Tensor)
-                    else torch.from_numpy(y)
-                )
+                all_targets.append(torch.from_numpy(y) if isinstance(y, np.ndarray) else y)
 
         # Compute metrics
         metrics = {}
         if len(all_preds) > 0:
-            import torch
-
             all_preds = torch.cat(all_preds, dim=0)
             all_targets = torch.cat(all_targets, dim=0)
 
@@ -367,7 +575,7 @@ class Trainer:
         """Save model weights and training state.
 
         Args:
-            path: Path to save checkpoint
+            path: Path to save checkpoint.
         """
         # Save Keras model weights
         self.model.model.save_weights(path)
@@ -378,7 +586,7 @@ class Trainer:
             "epoch": self.current_epoch + 1,
             "best_val_loss": self.best_val_loss,
             "patience_counter": self.patience_counter,
-            "config": dict(self.config),
+            "config": self.config.model_dump(),
         }
         with open(state_path, "w") as f:
             json.dump(state, f, indent=2)
@@ -387,7 +595,7 @@ class Trainer:
         """Load model weights and training state.
 
         Args:
-            path: Path to checkpoint
+            path: Path to checkpoint.
         """
         # Load Keras weights
         self.model.model.load_weights(path)
@@ -407,35 +615,36 @@ def create_trainer_from_config(
     model: SeqNN,
     train_loader: DataLoader | list[DataLoader],
     val_loader: DataLoader | list[DataLoader],
-    config: dict,
+    config: TrainerConfig,
     device: str = "cuda",
 ) -> Trainer:
-    """Factory function to create Trainer from config dict.
+    """Factory function to create Trainer from TrainerConfig.
+
+    This is a convenience function that creates a Trainer from a TrainerConfig.
 
     Args:
-        model: The SeqNN model to train
-        train_loader: Training data loader
-        val_loader: Validation data loader
-        config: Configuration dictionary (e.g., from train.json)
-        device: Device to train on
+        model: The SeqNN model to train.
+        train_loader: Training data loader.
+        val_loader: Validation data loader.
+        config: TrainerConfig instance.
+        device: Device to train on.
 
     Returns:
-        Trainer instance
+        Trainer instance.
     """
-    # Convert dict to TrainConfig with defaults
-    train_config: TrainConfig = {
-        "batch_size": config.get("batch_size", 64),
-        "optimizer": config.get("optimizer", "adam"),
-        "learning_rate": config.get("learning_rate", 0.001),
-        "momentum": config.get("momentum", 0.0),
-        "weight_decay": config.get("weight_decay", 0.0),
-        "loss": config.get("loss", "mse"),
-        "patience": config.get("patience", 10),
-        "clip_norm": config.get("clip_norm", 0.0),
-        "train_epochs_max": config.get("train_epochs_max", 100),
-        "eval_interval": config.get("eval_interval", 1),
-        "save_interval": config.get("save_interval", 1),
-        "metrics": config.get("metrics", ["pearsonr"]),
-    }
+    builder = TrainerBuilder(config)
+    return (
+        builder.with_model(model)
+        .with_train_loader(train_loader)
+        .with_val_loader(val_loader)
+        .build()
+    )
 
-    return Trainer(model, train_loader, val_loader, train_config, device)
+
+# Export all classes and functions
+__all__ = [
+    "TrainerConfig",
+    "TrainerBuilder",
+    "Trainer",
+    "create_trainer_from_config",
+]

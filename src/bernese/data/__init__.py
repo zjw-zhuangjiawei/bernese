@@ -3,8 +3,6 @@
 # Import dataset
 from bernese.data.dataset import (
     GenomicDataset,
-    DatasetWriter,
-    create_data_loaders_v2,
     create_data_loaders,
     MultiDatasetWrapper,
 )
@@ -15,6 +13,7 @@ from bernese.data.backends import (
     DatasetMetadata,
     SplitMetadata,
     HDF5Backend,
+    HDF5Writer,
 )
 
 # Import transforms
@@ -46,8 +45,6 @@ from bernese.data.preparation import (
 __all__ = [
     # Dataset
     "GenomicDataset",
-    "DatasetWriter",
-    "create_data_loaders_v2",
     "create_data_loaders",
     "MultiDatasetWrapper",
     # Backends
@@ -55,6 +52,7 @@ __all__ = [
     "DatasetMetadata",
     "SplitMetadata",
     "HDF5Backend",
+    "HDF5Writer",
     # Transforms
     "Transform",
     "TransformPipeline",

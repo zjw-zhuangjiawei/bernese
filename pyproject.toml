@@ -19,10 +19,12 @@ dependencies = [
     "einops>=0.8.2",
     "torchinfo>=1.8.0",
     "keras>=3.13.2",
+    "pydantic>=2.12.5",
 ]
 
 [project.optional-dependencies]
 cu130 = ["torch>=2"]
+ipykernel = ["ipykernel>=7"]
 
 [project.scripts]
 bernese = "bernese.cli:app"
@@ -34,9 +36,7 @@ package = true
 torch = [
     { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'", extra = "cu130" },
 ]
-# torchvision = [
-#     { index = "pytorch-cu130", marker = "sys_platform == 'linux' or sys_platform == 'win32'", extra = "cu130" },
-# ]
+
 
 [[tool.uv.index]]
 name = "pytorch-cu130"

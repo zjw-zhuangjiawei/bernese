@@ -6,16 +6,14 @@ This module provides a unified PyTorch Dataset interface that supports
 multiple storage backends and composable transforms.
 """
 
-from __future__ import annotations
-
 from pathlib import Path
-from typing import Any, Callable, Optional
+from typing import Optional
 
 import numpy as np
 import torch
 from torch.utils.data import DataLoader, Dataset
 
-from bernese.data.backends import DataBackend, HDF5Backend, HDF5Writer
+from bernese.data.backends import DataBackend, HDF5Backend
 from bernese.data.transforms import TransformPipeline
 
 
@@ -177,24 +175,20 @@ class GenomicDataset(Dataset):
         self._tgt_cache.clear()
 
 
-def create_data_loaders_v2(
+def create_data_loaders(
     data_dir: str | Path,
     batch_size: int = 64,
     num_workers: int = 0,
     shuffle_train: bool = True,
-    seq_length_crop: int = 0,
-    target_length_crop: int = 0,
     pin_memory: bool = True,
 ) -> tuple[DataLoader, DataLoader, Optional[DataLoader]]:
-    """Create train, validation, and test data loaders (v2 API).
+    """Create train, validation, and test data loaders.
 
     Args:
         data_dir: Path to data directory
         batch_size: Batch size for loading
         num_workers: Number of worker processes
         shuffle_train: Whether to shuffle training data
-        seq_length_crop: Crop length from sequence ends (deprecated, use transforms)
-        target_length_crop: Crop length from target ends (deprecated, use transforms)
         pin_memory: Whether to pin memory for GPU transfer
 
     Returns:
@@ -253,128 +247,6 @@ def create_data_loaders_v2(
         )
 
     return train_loader, val_loader, test_loader
-
-
-# Backwards compatibility alias
-create_data_loaders = create_data_loaders_v2
-
-
-class DatasetWriter:
-    """Backward-compatible wrapper for HDF5Writer.
-
-    This class delegates to HDF5Writer for all operations.
-    See HDF5Writer for full documentation.
-
-    Example:
-        writer = DatasetWriter("output_dir")
-
-        # Write pre-encoded genome
-        writer.write_genome(genome_dict)
-
-        # Write indices
-        writer.write_indices("train", chrom_indices, starts, ends)
-
-        # Write targets
-        writer.write_targets("train", targets)
-
-        # Finalize
-        writer.finalize(...)
-    """
-
-    def __init__(
-        self,
-        output_dir: str | Path,
-        seq_length: int = 131072,
-        seq_depth: int = 4,
-        target_length: int = 0,
-        num_targets: int = 1,
-    ):
-        # Delegate to HDF5Writer
-        self._writer = HDF5Writer(
-            output_dir=output_dir,
-            seq_length=seq_length,
-            seq_depth=seq_depth,
-            target_length=target_length,
-            num_targets=num_targets,
-        )
-
-        # Expose attributes for backward compatibility
-        self.output_dir = self._writer.output_dir
-        self.seq_length = self._writer.seq_length
-        self.seq_depth = self._writer.seq_depth
-        self.target_length = self._writer.target_length
-        self.num_targets = self._writer.num_targets
-
-    def write_genome(
-        self,
-        genome_dict: dict[int, np.ndarray],
-    ) -> None:
-        """Write pre-encoded genome to HDF5.
-
-        Args:
-            genome_dict: Dictionary mapping chrom_idx to 1hot encoded array
-        """
-        self._writer.write_genome(genome_dict)
-
-    def write_indices(
-        self,
-        split: str,
-        chrom_indices: list[int],
-        starts: list[int],
-        ends: list[int],
-    ) -> None:
-        """Write sequence indices for a split.
-
-        Args:
-            split: Split name (train/valid/test)
-            chrom_indices: List of chromosome indices
-            starts: List of start positions
-            ends: List of end positions
-        """
-        self._writer.write_indices(split, chrom_indices, starts, ends)
-
-    def write_coordinates(
-        self,
-        split: str,
-        coordinates: list[tuple[str, int, int]],
-    ) -> None:
-        """Write genomic coordinates for a split."""
-        self._writer.write_coordinates(split, coordinates)
-
-    def write_sequences(
-        self,
-        split: str,
-        sequences: np.ndarray,
-        chunk_size: int = 256,
-    ) -> None:
-        """Write pre-extracted sequences for a split (legacy compatibility)."""
-        self._writer.write_sequences(split, sequences, chunk_size)
-
-    def write_targets(
-        self,
-        split: str,
-        targets: np.ndarray,
-        chunk_size: int = 1024,
-    ) -> None:
-        """Write targets for a split."""
-        self._writer.write_targets(split, targets, chunk_size)
-
-    def finalize(
-        self,
-        genome_name: str = "",
-        target_type: str = "unknown",
-        pool_width: int = 1,
-        diagonal_offset: int = 0,
-        target_info: list[dict] | None = None,
-    ) -> "DatasetMetadata":
-        """Finalize dataset by creating manifest.json."""
-        return self._writer.finalize(
-            genome_name=genome_name,
-            target_type=target_type,
-            pool_width=pool_width,
-            diagonal_offset=diagonal_offset,
-            target_info=target_info,
-        )
 
 
 class MultiDatasetWrapper(Dataset):

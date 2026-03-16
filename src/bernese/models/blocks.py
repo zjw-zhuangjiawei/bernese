@@ -4,10 +4,12 @@
 
 This module provides functional block definitions ported from the TensorFlow
 baskerville implementation, adapted for Keras 3.
+
+Each block function now accepts a Pydantic Config object as its second argument.
 """
 
 import math
-from typing import Optional, List, Any
+from typing import Optional, List, Any, Union
 
 import keras
 from keras import ops
@@ -22,10 +24,50 @@ from bernese.models.layers import (
     UpperTri,
     activate as activate_layer,
 )
+from bernese.models.config import (
+    ConvBlockConfig,
+    ConvNACConfig,
+    ConvDNAConfig,
+    ConvBlock2DConfig,
+    ConvTowerConfig,
+    ConvTowerNACConfig,
+    ResTowerConfig,
+    DenseBlockConfig,
+    FinalConfig,
+    DilatedResidualConfig,
+    DilatedResidual2DConfig,
+    OneToTwoConfig,
+    ConcatDist2DConfig,
+    Symmetrize2DConfig,
+    UpperTriConfig,
+    Cropping2DConfig,
+    SqueezeExciteConfig,
+)
 
 
 # Type alias for tensor
 Tensor = Any
+
+# Type alias for block config
+BlockConfig = Union[
+    ConvBlockConfig,
+    ConvNACConfig,
+    ConvDNAConfig,
+    ConvBlock2DConfig,
+    ConvTowerConfig,
+    ConvTowerNACConfig,
+    ResTowerConfig,
+    DenseBlockConfig,
+    FinalConfig,
+    DilatedResidualConfig,
+    DilatedResidual2DConfig,
+    OneToTwoConfig,
+    ConcatDist2DConfig,
+    Symmetrize2DConfig,
+    UpperTriConfig,
+    Cropping2DConfig,
+    SqueezeExciteConfig,
+]
 
 
 ############################################################
@@ -33,299 +75,202 @@ Tensor = Any
 ############################################################
 
 
-def conv_block(
-    inputs: Tensor,
-    filters: Optional[int] = None,
-    kernel_size: int = 1,
-    activation: str = "relu",
-    activation_end: Optional[str] = None,
-    stride: int = 1,
-    dilation_rate: int = 1,
-    l2_scale: float = 0,
-    l1_scale: float = 0,
-    dropout: float = 0,
-    conv_type: str = "standard",
-    pool_size: int = 1,
-    pool_type: str = "max",
-    norm_type: Optional[str] = None,
-    bn_momentum: float = 0.99,
-    norm_gamma: Optional[str] = None,
-    residual: bool = False,
-    kernel_initializer: str = "he_normal",
-    padding: str = "same",
-) -> Tensor:
+def conv_block(inputs: Tensor, config: ConvBlockConfig) -> Tensor:
     """Construct a single convolution block.
 
     Args:
         inputs: Input tensor [batch_size, seq_length, features]
-        filters: Conv1D filters
-        kernel_size: Conv1D kernel_size
-        activation: relu/gelu/etc
-        activation_end: Activation after residual and before pool
-        stride: Conv1D stride
-        dilation_rate: Conv1D dilation rate
-        l2_scale: L2 regularization weight
-        l1_scale: L1 regularization weight
-        dropout: Dropout rate probability
-        conv_type: Conv1D layer type
-        residual: Residual connection boolean
-        pool_size: Max pool width
-        norm_type: Apply batch or layer normalization
-        bn_momentum: BatchNorm momentum
-        norm_gamma: BatchNorm gamma initializer
-        kernel_initializer: Weight initialization
+        config: ConvBlockConfig configuration
 
     Returns:
         Output tensor [batch_size, seq_length, features]
     """
     current = inputs
+    c = config
 
     # Choose convolution type
-    if conv_type == "separable":
+    if c.conv_type == "separable":
         conv_layer = keras.layers.SeparableConv1D
     else:
         conv_layer = keras.layers.Conv1D
 
-    if filters is None:
-        filters = inputs.shape[-1]
+    filters = c.filters if c.filters is not None else inputs.shape[-1]
 
     # Activation
-    current = activate_layer(current, activation)
+    current = activate_layer(current, c.activation)
 
     # Convolution
     current = conv_layer(
         filters=filters,
-        kernel_size=kernel_size,
-        strides=stride,
-        padding=padding,
-        use_bias=(norm_type is None),
-        dilation_rate=dilation_rate,
-        kernel_initializer=kernel_initializer,
-        kernel_regularizer=keras.regularizers.l1_l2(l1_scale, l2_scale) if l1_scale > 0 or l2_scale > 0 else None,
+        kernel_size=c.kernel_size,
+        strides=c.stride,
+        padding=c.padding,
+        use_bias=(c.norm_type is None),
+        dilation_rate=c.dilation_rate,
+        kernel_initializer=c.kernel_initializer,
+        kernel_regularizer=keras.regularizers.l1_l2(c.l1_scale, c.l2_scale)
+        if c.l1_scale > 0 or c.l2_scale > 0
+        else None,
     )(current)
 
     # Normalize
-    if norm_type == "batch":
+    if c.norm_type == "batch":
         current = keras.layers.BatchNormalization(
-            momentum=bn_momentum,
-            gamma_initializer=norm_gamma or ("zeros" if residual else "ones"),
+            momentum=c.bn_momentum,
+            gamma_initializer=c.norm_gamma or ("zeros" if c.residual else "ones"),
         )(current)
-    elif norm_type == "layer":
+    elif c.norm_type == "layer":
         current = keras.layers.LayerNormalization(
-            gamma_initializer=norm_gamma or ("zeros" if residual else "ones"),
+            gamma_initializer=c.norm_gamma or ("zeros" if c.residual else "ones"),
         )(current)
 
     # Dropout
-    if dropout > 0:
-        current = keras.layers.Dropout(rate=dropout)(current)
+    if c.dropout > 0:
+        current = keras.layers.Dropout(rate=c.dropout)(current)
 
     # Residual add
-    if residual:
+    if c.residual:
         current = keras.layers.Add()([inputs, current])
 
     # End activation
-    if activation_end is not None:
-        current = activate_layer(current, activation_end)
+    if c.activation_end is not None:
+        current = activate_layer(current, c.activation_end)
 
     # Pool
-    if pool_size > 1:
-        if pool_type == "softmax":
-            current = SoftmaxPool1D(pool_size=pool_size)(current)
-        elif pool_type == "avg":
-            current = keras.layers.AvgPool1D(pool_size=pool_size, padding=padding)(current)
+    if c.pool_size > 1:
+        if c.pool_type == "softmax":
+            current = SoftmaxPool1D(pool_size=c.pool_size)(current)
+        elif c.pool_type == "avg":
+            current = keras.layers.AvgPool1D(pool_size=c.pool_size, padding=c.padding)(current)
         else:
-            current = keras.layers.MaxPool1D(pool_size=pool_size, padding=padding)(current)
+            current = keras.layers.MaxPool1D(pool_size=c.pool_size, padding=c.padding)(current)
 
     return current
 
 
-def conv_nac(
-    inputs: Tensor,
-    filters: Optional[int] = None,
-    kernel_size: int = 1,
-    activation: str = "relu",
-    stride: int = 1,
-    dilation_rate: int = 1,
-    l2_scale: float = 0,
-    dropout: float = 0,
-    conv_type: str = "standard",
-    residual: bool = False,
-    pool_size: int = 1,
-    pool_type: str = "max",
-    norm_type: Optional[str] = None,
-    bn_momentum: float = 0.99,
-    norm_gamma: Optional[str] = None,
-    kernel_initializer: str = "he_normal",
-    padding: str = "same",
-    se: bool = False,
-) -> Tensor:
+def conv_nac(inputs: Tensor, config: ConvNACConfig) -> Tensor:
     """Construct a NAC (Norm-Act-Conv) block.
 
     Args:
         inputs: Input tensor [batch_size, seq_length, features]
-        filters: Conv1D filters
-        kernel_size: Conv1D kernel_size
-        activation: relu/gelu/etc
-        stride: Conv1D stride
-        dilation_rate: Conv1D dilation rate
-        l2_scale: L2 regularization weight
-        dropout: Dropout rate probability
-        conv_type: Conv1D layer type
-        residual: Residual connection boolean
-        pool_size: Max pool width
-        pool_type: Pool type
-        norm_type: Apply batch or layer normalization
-        bn_momentum: BatchNorm momentum
-        norm_gamma: BatchNorm gamma initializer
-        kernel_initializer: Weight initialization
-        se: Use squeeze-excitation
+        config: ConvNACConfig configuration
 
     Returns:
         Output tensor [batch_size, seq_length, features]
     """
     current = inputs
+    c = config
 
     # Choose convolution type
-    if conv_type == "separable":
+    if c.conv_type == "separable":
         conv_layer = keras.layers.SeparableConv1D
     else:
         conv_layer = keras.layers.Conv1D
 
-    if filters is None:
-        filters = inputs.shape[-1]
+    filters = c.filters if c.filters is not None else inputs.shape[-1]
 
     # Normalize (NAC pattern: norm first)
-    if norm_type == "batch":
+    if c.norm_type == "batch":
         current = keras.layers.BatchNormalization(
-            momentum=bn_momentum,
-            gamma_initializer=norm_gamma or ("zeros" if residual else "ones"),
+            momentum=c.bn_momentum,
+            gamma_initializer=c.norm_gamma or ("zeros" if c.residual else "ones"),
         )(current)
-    elif norm_type == "layer":
+    elif c.norm_type == "layer":
         current = keras.layers.LayerNormalization(
-            gamma_initializer=norm_gamma or ("zeros" if residual else "ones"),
+            gamma_initializer=c.norm_gamma or ("zeros" if c.residual else "ones"),
         )(current)
 
     # Activation
-    current = activate_layer(current, activation)
+    current = activate_layer(current, c.activation)
 
     # Convolution
     current = conv_layer(
         filters=filters,
-        kernel_size=kernel_size,
-        strides=stride,
-        padding=padding,
+        kernel_size=c.kernel_size,
+        strides=c.stride,
+        padding=c.padding,
         use_bias=True,
-        dilation_rate=dilation_rate,
-        kernel_initializer=kernel_initializer,
-        kernel_regularizer=keras.regularizers.l2(l2_scale) if l2_scale > 0 else None,
+        dilation_rate=c.dilation_rate,
+        kernel_initializer=c.kernel_initializer,
+        kernel_regularizer=keras.regularizers.l2(c.l2_scale) if c.l2_scale > 0 else None,
     )(current)
 
     # Squeeze-excitation
-    if se:
+    if c.se:
         current = SqueezeExcite(rank=8)(current)
 
     # Dropout
-    if dropout > 0:
-        current = keras.layers.Dropout(rate=dropout)(current)
+    if c.dropout > 0:
+        current = keras.layers.Dropout(rate=c.dropout)(current)
 
     # Residual add
-    if residual:
+    if c.residual:
         current = keras.layers.Add()([inputs, current])
 
     # Pool
-    if pool_size > 1:
-        if pool_type == "softmax":
-            current = SoftmaxPool1D(pool_size=pool_size)(current)
-        elif pool_type == "avg":
-            current = keras.layers.AvgPool1D(pool_size=pool_size, padding=padding)(current)
+    if c.pool_size > 1:
+        if c.pool_type == "softmax":
+            current = SoftmaxPool1D(pool_size=c.pool_size)(current)
+        elif c.pool_type == "avg":
+            current = keras.layers.AvgPool1D(pool_size=c.pool_size, padding=c.padding)(current)
         else:
-            current = keras.layers.MaxPool1D(pool_size=pool_size, padding=padding)(current)
+            current = keras.layers.MaxPool1D(pool_size=c.pool_size, padding=c.padding)(current)
 
     return current
 
 
-def conv_dna(
-    inputs: Tensor,
-    filters: Optional[int] = None,
-    kernel_size: int = 15,
-    activation: str = "relu",
-    stride: int = 1,
-    l2_scale: float = 0,
-    residual: bool = False,
-    dropout: float = 0,
-    dropout_residual: float = 0,
-    pool_size: int = 1,
-    pool_type: str = "max",
-    norm_type: Optional[str] = None,
-    bn_momentum: float = 0.99,
-    norm_gamma: Optional[str] = None,
-    use_bias: Optional[bool] = None,
-    se: bool = False,
-    conv_type: str = "standard",
-    kernel_initializer: str = "he_normal",
-    padding: str = "same",
-) -> Tensor:
+def conv_dna(inputs: Tensor, config: ConvDNAConfig) -> Tensor:
     """Construct a DNA convolution block.
 
     Args:
         inputs: Input tensor [batch_size, seq_length, features]
-        filters: Conv1D filters
-        kernel_size: Conv1D kernel_size
-        activation: relu/gelu/etc
-        stride: Conv1D stride
-        l2_scale: L2 regularization weight
-        dropout: Dropout rate probability
-        conv_type: Conv1D layer type
-        pool_size: Max pool width
-        norm_type: Apply batch or layer normalization
-        bn_momentum: BatchNorm momentum
+        config: ConvDNAConfig configuration
 
     Returns:
         Output tensor [batch_size, seq_length, features]
     """
     current = inputs
+    c = config
 
     # Choose convolution type
-    if conv_type == "separable":
+    if c.conv_type == "separable":
         conv_layer = keras.layers.SeparableConv1D
     else:
         conv_layer = keras.layers.Conv1D
 
-    if filters is None:
-        filters = inputs.shape[-1]
+    filters = c.filters if c.filters is not None else inputs.shape[-1]
 
     # Determine bias
-    if use_bias is None:
-        use_bias = norm_type is None and not residual
+    use_bias = c.use_bias if c.use_bias is not None else (c.norm_type is None and not c.residual)
 
     # Convolution
     current = conv_layer(
         filters=filters,
-        kernel_size=kernel_size,
-        strides=stride,
-        padding=padding,
+        kernel_size=c.kernel_size,
+        strides=c.stride,
+        padding=c.padding,
         use_bias=use_bias,
-        kernel_initializer=kernel_initializer,
-        kernel_regularizer=keras.regularizers.l2(l2_scale) if l2_scale > 0 else None,
+        kernel_initializer=c.kernel_initializer,
+        kernel_regularizer=keras.regularizers.l2(c.l2_scale) if c.l2_scale > 0 else None,
     )(current)
 
     # Squeeze-excitation
-    if se:
+    if c.se:
         current = SqueezeExcite(rank=8)(current)
 
-    if residual:
-        # Residual conv block
-        rcurrent = conv_nac(
-            current,
-            activation=activation,
-            l2_scale=l2_scale,
-            dropout=dropout_residual,
-            conv_type=conv_type,
-            norm_type=norm_type,
-            se=se,
-            bn_momentum=bn_momentum,
-            kernel_initializer=kernel_initializer,
+    if c.residual:
+        # Residual conv block using conv_nac
+        residual_config = ConvNACConfig(
+            activation=c.activation,
+            l2_scale=c.l2_scale,
+            dropout=c.dropout_residual,
+            conv_type=c.conv_type,
+            norm_type=c.norm_type,
+            se=c.se,
+            bn_momentum=c.bn_momentum,
+            kernel_initializer=c.kernel_initializer,
         )
+        rcurrent = conv_nac(current, residual_config)
 
         # Residual add with scale
         rcurrent = Scale()(rcurrent)
@@ -333,90 +278,83 @@ def conv_dna(
 
     else:
         # Normalize
-        if norm_type == "batch":
-            current = keras.layers.BatchNormalization(momentum=bn_momentum)(current)
-        elif norm_type == "layer":
+        if c.norm_type == "batch":
+            current = keras.layers.BatchNormalization(momentum=c.bn_momentum)(current)
+        elif c.norm_type == "layer":
             current = keras.layers.LayerNormalization()(current)
 
         # Activation
-        current = activate_layer(current, activation)
+        current = activate_layer(current, c.activation)
 
     # Dropout
-    if dropout > 0:
-        current = keras.layers.Dropout(rate=dropout)(current)
+    if c.dropout > 0:
+        current = keras.layers.Dropout(rate=c.dropout)(current)
 
     # Pool
-    if pool_size > 1:
-        if pool_type == "softmax":
-            current = SoftmaxPool1D(pool_size=pool_size)(current)
-        elif pool_type == "avg":
-            current = keras.layers.AvgPool1D(pool_size=pool_size, padding=padding)(current)
+    if c.pool_size > 1:
+        if c.pool_type == "softmax":
+            current = SoftmaxPool1D(pool_size=c.pool_size)(current)
+        elif c.pool_type == "avg":
+            current = keras.layers.AvgPool1D(pool_size=c.pool_size, padding=c.padding)(current)
         else:
-            current = keras.layers.MaxPool1D(pool_size=pool_size, padding=padding)(current)
+            current = keras.layers.MaxPool1D(pool_size=c.pool_size, padding=c.padding)(current)
 
     return current
 
 
-def conv_block_2d(
-    inputs: Tensor,
-    filters: int = 128,
-    activation: str = "relu",
-    conv_type: str = "standard",
-    kernel_size: int = 1,
-    stride: int = 1,
-    dilation_rate: int = 1,
-    l2_scale: float = 0,
-    dropout: float = 0,
-    pool_size: int = 1,
-    norm_type: Optional[str] = None,
-    bn_momentum: float = 0.99,
-    norm_gamma: str = "ones",
-    kernel_initializer: str = "he_normal",
-    symmetric: bool = False,
-) -> Tensor:
-    """Construct a single 2D convolution block."""
+def conv_block_2d(inputs: Tensor, config: ConvBlock2DConfig) -> Tensor:
+    """Construct a single 2D convolution block.
+
+    Args:
+        inputs: Input tensor
+        config: ConvBlock2DConfig configuration
+
+    Returns:
+        Output tensor
+    """
     current = inputs
+    c = config
 
     # Activation
-    current = activate_layer(current, activation)
+    current = activate_layer(current, c.activation)
 
     # Choose convolution type
-    if conv_type == "separable":
+    if c.conv_type == "separable":
         conv_layer = keras.layers.SeparableConv2D
     else:
         conv_layer = keras.layers.Conv2D
 
     # Convolution
     current = conv_layer(
-        filters=filters,
-        kernel_size=kernel_size,
-        strides=stride,
+        filters=c.filters,
+        kernel_size=c.kernel_size,
+        strides=c.stride,
         padding="same",
-        use_bias=(norm_type is None),
-        dilation_rate=dilation_rate,
-        kernel_initializer=kernel_initializer,
-        kernel_regularizer=keras.regularizers.l2(l2_scale) if l2_scale > 0 else None,
+        use_bias=(c.norm_type is None),
+        dilation_rate=c.dilation_rate,
+        kernel_initializer=c.kernel_initializer,
+        kernel_regularizer=keras.regularizers.l2(c.l2_scale) if c.l2_scale > 0 else None,
     )(current)
 
     # Normalize
-    if norm_type == "batch":
+    if c.norm_type == "batch":
         current = keras.layers.BatchNormalization(
-            momentum=bn_momentum,
-            gamma_initializer=norm_gamma,
+            momentum=c.bn_momentum,
+            gamma_initializer=c.norm_gamma,
         )(current)
-    elif norm_type == "layer":
-        current = keras.layers.LayerNormalization(gamma_initializer=norm_gamma)(current)
+    elif c.norm_type == "layer":
+        current = keras.layers.LayerNormalization(gamma_initializer=c.norm_gamma)(current)
 
     # Dropout
-    if dropout > 0:
-        current = keras.layers.Dropout(rate=dropout)(current)
+    if c.dropout > 0:
+        current = keras.layers.Dropout(rate=c.dropout)(current)
 
     # Pool
-    if pool_size > 1:
-        current = keras.layers.MaxPool2D(pool_size=pool_size, padding="same")(current)
+    if c.pool_size > 1:
+        current = keras.layers.MaxPool2D(pool_size=c.pool_size, padding="same")(current)
 
     # Symmetric
-    if symmetric:
+    if c.symmetric:
         current = Symmetrize2D()(current)
 
     return current
@@ -428,161 +366,209 @@ def conv_block_2d(
 
 
 def conv_tower(
-    inputs: Tensor,
-    filters_init: int,
-    filters_end: Optional[int] = None,
-    filters_mult: Optional[float] = None,
-    divisible_by: int = 1,
-    repeat: int = 1,
-    reprs: Optional[List[Tensor]] = None,
-    **kwargs,
+    inputs: Tensor, config: ConvTowerConfig, reprs: Optional[list[keras.KerasTensor]] = None
 ) -> Tensor:
     """Construct a reducing convolution tower.
 
     Args:
         inputs: Input tensor [batch_size, seq_length, features]
-        filters_init: Initial Conv1D filters
-        filters_end: End Conv1D filters
-        filters_mult: Multiplier for Conv1D filters
-        divisible_by: Round filters to be divisible by
-        repeat: Tower repetitions
+        config: ConvTowerConfig configuration
         reprs: List to save representations
 
     Returns:
         Output tensor [batch_size, seq_length, features]
     """
+    c = config
+
     def _round(x):
-        return int(round(x / divisible_by) * divisible_by)
+        return int(round(x / c.divisible_by) * c.divisible_by)
 
     current = inputs
-    rep_filters = float(filters_init)
+    rep_filters = float(c.filters_init)
 
     # Determine multiplier
-    if filters_mult is None:
-        assert filters_end is not None
-        filters_mult = math.exp(math.log(filters_end / filters_init) / (repeat - 1))
+    if c.filters_mult is None:
+        c.filters_mult = math.exp(math.log(c.filters_end / c.filters_init) / (c.repeat - 1))
 
-    for ri in range(repeat):
+    for ri in range(c.repeat):
+        # Create config for conv_block
+        block_config = ConvBlockConfig(
+            filters=_round(rep_filters),
+            kernel_size=c.kernel_size,
+            activation=c.activation,
+            activation_end=c.activation_end,
+            stride=1,
+            dilation_rate=1,
+            conv_type=c.conv_type,
+            residual=c.residual,
+            norm_type=c.norm_type,
+            bn_momentum=c.bn_momentum,
+            norm_gamma=c.norm_gamma,
+            l2_scale=c.l2_scale,
+            l1_scale=c.l1_scale,
+            dropout=c.dropout,
+            kernel_initializer=c.kernel_initializer,
+            padding=c.padding,
+            pool_size=c.pool_size,
+            pool_type=c.pool_type,
+        )
+
         # Convolution
-        current = conv_block(current, filters=_round(rep_filters), **kwargs)
+        current = conv_block(current, block_config)
 
         # Save representation
         if reprs is not None:
             reprs.append(current)
 
         # Update filters
-        rep_filters *= filters_mult
+        rep_filters *= c.filters_mult
 
     return current
 
 
 def conv_tower_nac(
-    inputs: Tensor,
-    filters_init: int,
-    filters_end: Optional[int] = None,
-    filters_mult: Optional[float] = None,
-    divisible_by: int = 1,
-    repeat: int = 1,
-    reprs: Optional[List[Tensor]] = None,
-    **kwargs,
+    inputs: Tensor, config: ConvTowerNACConfig, reprs: Optional[list[keras.KerasTensor]] = None
 ) -> Tensor:
-    """Construct a reducing convolution tower using NAC blocks."""
+    """Construct a reducing convolution tower using NAC blocks.
+
+    Args:
+        inputs: Input tensor [batch_size, seq_length, features]
+        config: ConvTowerNACConfig configuration
+        reprs: List to save representations
+
+    Returns:
+        Output tensor [batch_size, seq_length, features]
+    """
+    c = config
+
     def _round(x):
-        return int(round(x / divisible_by) * divisible_by)
+        return int(round(x / c.divisible_by) * c.divisible_by)
 
     current = inputs
-    rep_filters = float(filters_init)
+    rep_filters = float(c.filters_init)
 
     # Determine multiplier
-    if filters_mult is None:
-        assert filters_end is not None
-        filters_mult = math.exp(math.log(filters_end / filters_init) / (repeat - 1))
+    if c.filters_mult is None:
+        c.filters_mult = math.exp(math.log(c.filters_end / c.filters_init) / (c.repeat - 1))
 
-    for ri in range(repeat):
+    for ri in range(c.repeat):
+        # Create config for conv_nac
+        block_config = ConvNACConfig(
+            filters=_round(rep_filters),
+            kernel_size=c.kernel_size,
+            activation=c.activation,
+            stride=1,
+            dilation_rate=1,
+            conv_type=c.conv_type,
+            residual=c.residual,
+            norm_type=c.norm_type,
+            bn_momentum=c.bn_momentum,
+            norm_gamma=c.norm_gamma,
+            l2_scale=c.l2_scale,
+            dropout=c.dropout,
+            kernel_initializer=c.kernel_initializer,
+            padding=c.padding,
+            pool_size=c.pool_size,
+            pool_type=c.pool_type,
+        )
+
         # Convolution
-        current = conv_nac(current, filters=_round(rep_filters), **kwargs)
+        current = conv_nac(current, block_config)
 
         # Save representation
         if reprs is not None:
             reprs.append(current)
 
         # Update filters
-        rep_filters *= filters_mult
+        rep_filters *= c.filters_mult
 
     return current
 
 
 def res_tower(
-    inputs: Tensor,
-    filters_init: int,
-    filters_end: Optional[int] = None,
-    filters_mult: Optional[float] = None,
-    kernel_size: int = 1,
-    dropout: float = 0,
-    pool_size: int = 2,
-    pool_type: str = "max",
-    divisible_by: int = 1,
-    repeat: int = 1,
-    num_convs: int = 2,
-    reprs: Optional[List[Tensor]] = None,
-    **kwargs,
+    inputs: Tensor, config: ResTowerConfig, reprs: Optional[list[keras.KerasTensor]] = None
 ) -> Tensor:
-    """Construct a residual tower with pooling between blocks."""
+    """Construct a residual tower with pooling between blocks.
+
+    Args:
+        inputs: Input tensor [batch_size, seq_length, features]
+        config: ResTowerConfig configuration
+        reprs: List to save representations
+
+    Returns:
+        Output tensor [batch_size, seq_length, features]
+    """
+    c = config
+
     def _round(x):
-        return int(round(x / divisible_by) * divisible_by)
+        return int(round(x / c.divisible_by) * c.divisible_by)
 
     current = inputs
-    rep_filters = float(filters_init)
+    rep_filters = float(c.filters_init)
 
     # Determine multiplier
-    if filters_mult is None:
-        assert filters_end is not None
-        filters_mult = math.exp(math.log(filters_end / filters_init) / (repeat - 1))
+    if c.filters_mult is None:
+        c.filters_mult = math.exp(math.log(c.filters_end / c.filters_init) / (c.repeat - 1))
 
-    for ri in range(repeat):
+    for ri in range(c.repeat):
         rep_filters_int = _round(rep_filters)
 
         # Initial conv
-        current0 = conv_nac(
-            current,
+        block_config0 = ConvNACConfig(
             filters=rep_filters_int,
-            kernel_size=kernel_size,
-            **kwargs
+            kernel_size=c.kernel_size,
+            activation=c.activation,
+            conv_type=c.conv_type,
+            residual=c.residual,
+            norm_type=c.norm_type,
+            bn_momentum=c.bn_momentum,
+            norm_gamma=c.norm_gamma,
+            l2_scale=c.l2_scale,
+            kernel_initializer=c.kernel_initializer,
         )
+        current0 = conv_nac(current, block_config0)
 
         # Subsequent convs
         current = current0
-        for ci in range(1, num_convs):
-            current = conv_nac(
-                current,
+        for ci in range(1, c.num_convs):
+            block_config = ConvNACConfig(
                 filters=rep_filters_int,
-                **kwargs
+                kernel_size=c.kernel_size,
+                activation=c.activation,
+                conv_type=c.conv_type,
+                residual=c.residual,
+                norm_type=c.norm_type,
+                bn_momentum=c.bn_momentum,
+                norm_gamma=c.norm_gamma,
+                l2_scale=c.l2_scale,
+                kernel_initializer=c.kernel_initializer,
             )
+            current = conv_nac(current, block_config)
 
         # Residual add with scale
-        if num_convs > 1:
+        if c.num_convs > 1:
             current = Scale()(current)
             current = keras.layers.Add()([current0, current])
 
         # Dropout
-        if dropout > 0:
-            current = keras.layers.Dropout(rate=dropout)(current)
+        if c.dropout > 0:
+            current = keras.layers.Dropout(rate=c.dropout)(current)
 
         # Save representation
         if reprs is not None:
             reprs.append(current)
 
         # Pool
-        if pool_size > 1:
-            if pool_type == "softmax":
-                current = SoftmaxPool1D(pool_size=pool_size)(current)
-            elif pool_type == "avg":
-                current = keras.layers.AvgPool1D(pool_size=pool_size, padding="same")(current)
+        if c.pool_size > 1:
+            if c.pool_type == "softmax":
+                current = SoftmaxPool1D(pool_size=c.pool_size)(current)
+            elif c.pool_type == "avg":
+                current = keras.layers.AvgPool1D(pool_size=c.pool_size, padding="same")(current)
             else:
-                current = keras.layers.MaxPool1D(pool_size=pool_size, padding="same")(current)
+                current = keras.layers.MaxPool1D(pool_size=c.pool_size, padding="same")(current)
 
         # Update filters
-        rep_filters *= filters_mult
+        rep_filters *= c.filters_mult
 
     return current
 
@@ -592,79 +578,54 @@ def res_tower(
 ############################################################
 
 
-def dense_block(
-    inputs: Tensor,
-    units: Optional[int] = None,
-    activation: str = "relu",
-    activation_end: Optional[str] = None,
-    flatten: bool = False,
-    dropout: float = 0,
-    l2_scale: float = 0,
-    l1_scale: float = 0,
-    residual: bool = False,
-    norm_type: Optional[str] = None,
-    bn_momentum: float = 0.99,
-    norm_gamma: Optional[str] = None,
-    kernel_initializer: str = "he_normal",
-    **kwargs,
-) -> Tensor:
+def dense_block(inputs: Tensor, config: DenseBlockConfig) -> Tensor:
     """Construct a dense (fully connected) block.
 
     Args:
         inputs: Input tensor
-        units: Dense units
-        activation: Activation function
-        activation_end: Activation after other operations
-        flatten: Flatten across positional axis
-        dropout: Dropout rate probability
-        l2_scale: L2 regularization weight
-        l1_scale: L1 regularization weight
-        residual: Residual connection boolean
-        norm_type: Apply batch or layer normalization
-        bn_momentum: BatchNorm momentum
-        norm_gamma: BatchNorm gamma initializer
-        kernel_initializer: Weight initialization
+        config: DenseBlockConfig configuration
 
     Returns:
         Output tensor
     """
     current = inputs
+    c = config
 
-    if units is None:
-        units = inputs.shape[-1]
+    units = c.units if c.units is not None else inputs.shape[-1]
 
     # Activation
-    current = activate_layer(current, activation)
+    current = activate_layer(current, c.activation)
 
     # Flatten
-    if flatten:
+    if c.flatten:
         current = keras.layers.Flatten()(current)
 
     # Dense
     current = keras.layers.Dense(
         units=units,
-        use_bias=(norm_type is None),
-        kernel_initializer=kernel_initializer,
-        kernel_regularizer=keras.regularizers.l1_l2(l1_scale, l2_scale) if l1_scale > 0 or l2_scale > 0 else None,
+        use_bias=(c.norm_type is None),
+        kernel_initializer=c.kernel_initializer,
+        kernel_regularizer=keras.regularizers.l1_l2(c.l1_scale, c.l2_scale)
+        if c.l1_scale > 0 or c.l2_scale > 0
+        else None,
     )(current)
 
     # Normalize
-    if norm_gamma is None:
-        norm_gamma = "zeros" if residual else "ones"
-    if norm_type == "batch":
+    norm_gamma = c.norm_gamma if c.norm_gamma is not None else ("zeros" if c.residual else "ones")
+    if c.norm_type == "batch":
         current = keras.layers.BatchNormalization(
-            momentum=bn_momentum,
+            momentum=c.bn_momentum,
             gamma_initializer=norm_gamma,
         )(current)
-    elif norm_type == "layer":
+    elif c.norm_type == "layer":
         current = keras.layers.LayerNormalization(gamma_initializer=norm_gamma)(current)
 
     # Dropout
-    if dropout > 0:
-        current = keras.layers.Dropout(rate=dropout)(current)
+    if c.dropout > 0:
+        current = keras.layers.Dropout(rate=c.dropout)(current)
 
     # Residual add
-    if residual:
+    if c.residual:
         # Need matching shapes - apply projection if needed
         if inputs.shape[-1] != units:
             inputs_proj = keras.layers.Dense(units)(inputs)
@@ -673,49 +634,38 @@ def dense_block(
         current = keras.layers.Add()([inputs_proj, current])
 
     # End activation
-    if activation_end is not None:
-        current = activate_layer(current, activation_end)
+    if c.activation_end is not None:
+        current = activate_layer(current, c.activation_end)
 
     return current
 
 
-def final(
-    inputs: Tensor,
-    units: int,
-    activation: str = "linear",
-    flatten: bool = False,
-    kernel_initializer: str = "he_normal",
-    l2_scale: float = 0,
-    l1_scale: float = 0,
-    **kwargs,
-) -> Tensor:
+def final(inputs: Tensor, config: FinalConfig) -> Tensor:
     """Final simple transformation before comparison to targets.
 
     Args:
         inputs: Input tensor [batch_size, seq_length, features]
-        units: Dense units
-        activation: Output activation
-        flatten: Flatten positional axis
-        kernel_initializer: Weight initialization
-        l2_scale: L2 regularization weight
-        l1_scale: L1 regularization weight
+        config: FinalConfig configuration
 
     Returns:
         Output tensor [batch_size, seq_length(?), units]
     """
     current = inputs
+    c = config
 
     # Flatten
-    if flatten:
+    if c.flatten:
         current = keras.layers.Flatten()(current)
 
     # Dense
     current = keras.layers.Dense(
-        units=units,
+        units=c.units,
         use_bias=True,
-        activation=activation,
-        kernel_initializer=kernel_initializer,
-        kernel_regularizer=keras.regularizers.l1_l2(l1_scale, l2_scale) if l1_scale > 0 or l2_scale > 0 else None,
+        activation=c.activation,
+        kernel_initializer=c.kernel_initializer,
+        kernel_regularizer=keras.regularizers.l1_l2(c.l1_scale, c.l2_scale)
+        if c.l1_scale > 0 or c.l2_scale > 0
+        else None,
     )(current)
 
     return current
@@ -726,106 +676,131 @@ def final(
 ############################################################
 
 
-def dilated_residual(
-    inputs: Tensor,
-    filters: int,
-    kernel_size: int = 3,
-    rate_mult: float = 2,
-    dropout: float = 0,
-    repeat: int = 1,
-    conv_type: str = "standard",
-    norm_type: Optional[str] = None,
-    round_dilation: bool = False,
-    **kwargs,
-) -> Tensor:
-    """Construct a residual dilated convolution block."""
+def dilated_residual(inputs: Tensor, config: DilatedResidualConfig) -> Tensor:
+    """Construct a residual dilated convolution block.
+
+    Args:
+        inputs: Input tensor
+        config: DilatedResidualConfig configuration
+
+    Returns:
+        Output tensor
+    """
     current = inputs
+    c = config
     dilation_rate = 1.0
 
-    for ri in range(repeat):
+    for ri in range(c.repeat):
         rep_input = current
 
-        # Dilated conv
-        current = conv_block(
-            current,
-            filters=filters,
-            kernel_size=kernel_size,
+        # Create config for first conv_block
+        conv1_config = ConvBlockConfig(
+            filters=c.filters,
+            kernel_size=c.kernel_size,
+            activation=c.activation,
             dilation_rate=int(round(dilation_rate)),
-            conv_type=conv_type,
-            norm_type=norm_type,
+            conv_type=c.conv_type,
+            norm_type=c.norm_type,
             norm_gamma="ones",
-            **kwargs,
+            l2_scale=c.l2_scale,
+            l1_scale=c.l1_scale,
+            kernel_initializer=c.kernel_initializer,
+            padding=c.padding,
+        )
+
+        # Dilated conv
+        current = conv_block(current, conv1_config)
+
+        # Create config for second conv_block
+        conv2_config = ConvBlockConfig(
+            filters=rep_input.shape[-1],
+            activation=c.activation,
+            dilation_rate=1,
+            conv_type=c.conv_type,
+            norm_type=c.norm_type,
+            norm_gamma="zeros",
+            dropout=c.dropout,
+            l2_scale=c.l2_scale,
+            l1_scale=c.l1_scale,
+            kernel_initializer=c.kernel_initializer,
+            padding=c.padding,
         )
 
         # Return conv
-        current = conv_block(
-            current,
-            filters=rep_input.shape[-1],
-            dropout=dropout,
-            norm_type=norm_type,
-            norm_gamma="zeros",
-            **kwargs,
-        )
+        current = conv_block(current, conv2_config)
 
         # Residual add with scale
-        if norm_type is None:
+        if c.norm_type is None:
             current = Scale()(current)
 
         current = keras.layers.Add()([rep_input, current])
 
         # Update dilation rate
-        dilation_rate *= rate_mult
-        if round_dilation:
+        dilation_rate *= c.rate_mult
+        if c.round_dilation:
             dilation_rate = round(dilation_rate)
 
     return current
 
 
-def dilated_residual_2d(
-    inputs: Tensor,
-    filters: int,
-    kernel_size: int = 3,
-    rate_mult: float = 2,
-    dropout: float = 0,
-    repeat: int = 1,
-    symmetric: bool = True,
-    **kwargs,
-) -> Tensor:
-    """Construct a residual dilated convolution block for 2D."""
+def dilated_residual_2d(inputs: Tensor, config: DilatedResidual2DConfig) -> Tensor:
+    """Construct a residual dilated convolution block for 2D.
+
+    Args:
+        inputs: Input tensor
+        config: DilatedResidual2DConfig configuration
+
+    Returns:
+        Output tensor
+    """
     current = inputs
+    c = config
     dilation_rate = 1.0
 
-    for ri in range(repeat):
+    for ri in range(c.repeat):
         rep_input = current
 
-        # Dilated conv
-        current = conv_block_2d(
-            current,
-            filters=filters,
-            kernel_size=kernel_size,
+        # Create config for first conv_block_2d
+        conv1_config = ConvBlock2DConfig(
+            filters=c.filters,
+            kernel_size=c.kernel_size,
+            activation=c.activation,
             dilation_rate=int(round(dilation_rate)),
+            conv_type=c.conv_type,
+            norm_type=c.norm_type,
             norm_gamma="ones",
-            **kwargs,
+            l2_scale=c.l2_scale,
+            kernel_initializer=c.kernel_initializer,
+        )
+
+        # Dilated conv
+        current = conv_block_2d(current, conv1_config)
+
+        # Create config for second conv_block_2d
+        conv2_config = ConvBlock2DConfig(
+            filters=rep_input.shape[-1],
+            activation=c.activation,
+            dilation_rate=1,
+            conv_type=c.conv_type,
+            norm_type=c.norm_type,
+            norm_gamma="zeros",
+            dropout=c.dropout,
+            l2_scale=c.l2_scale,
+            kernel_initializer=c.kernel_initializer,
         )
 
         # Return conv
-        current = conv_block_2d(
-            current,
-            filters=rep_input.shape[-1],
-            dropout=dropout,
-            norm_gamma="zeros",
-            **kwargs,
-        )
+        current = conv_block_2d(current, conv2_config)
 
         # Residual add
         current = keras.layers.Add()([rep_input, current])
 
         # Enforce symmetry
-        if symmetric:
+        if c.symmetric:
             current = Symmetrize2D()(current)
 
         # Update dilation rate
-        dilation_rate *= rate_mult
+        dilation_rate *= c.rate_mult
 
     return current
 
@@ -835,61 +810,37 @@ def dilated_residual_2d(
 ############################################################
 
 
-def one_to_two(
-    inputs: Tensor,
-    operation: str = "mean",
-    **kwargs,
-) -> Tensor:
+def one_to_two(inputs: Tensor, config: OneToTwoConfig) -> Tensor:
     """Convert 1D to 2D contact map."""
-    return OneToTwo(operation=operation)(inputs)
+    return OneToTwo(operation=config.operation)(inputs)
 
 
-def symmetrize_2d(
-    inputs: Tensor,
-    **kwargs,
-) -> Tensor:
+def symmetrize_2d(inputs: Tensor, config: Symmetrize2DConfig) -> Tensor:
     """Symmetrize a 2D tensor."""
     return Symmetrize2D()(inputs)
 
 
-def upper_tri(
-    inputs: Tensor,
-    diagonal_offset: int = 2,
-    **kwargs,
-) -> Tensor:
+def upper_tri(inputs: Tensor, config: UpperTriConfig) -> Tensor:
     """Extract upper triangular part."""
-    return UpperTri(diagonal_offset=diagonal_offset)(inputs)
+    return UpperTri(diagonal_offset=config.diagonal_offset)(inputs)
 
 
-def concat_dist_2d(
-    inputs: Tensor,
-    **kwargs,
-) -> Tensor:
+def concat_dist_2d(inputs: Tensor, config: ConcatDist2DConfig) -> Tensor:
     """Concatenate distance features to 2D input."""
     return ConcatDist2D()(inputs)
 
 
-def cropping_2d(
-    inputs: Tensor,
-    cropping: int,
-    **kwargs,
-) -> Tensor:
+def cropping_2d(inputs: Tensor, config: Cropping2DConfig) -> Tensor:
     """Crop a 2D tensor."""
-    return keras.layers.Cropping2D(cropping=cropping)(inputs)
+    return keras.layers.Cropping2D(cropping=config.cropping)(inputs)
 
 
-def squeeze_excite(
-    inputs: Tensor,
-    activation: str = "relu",
-    additive: bool = False,
-    bottleneck_ratio: int = 8,
-    **kwargs,
-) -> Tensor:
+def squeeze_excite(inputs: Tensor, config: SqueezeExciteConfig) -> Tensor:
     """Squeeze-and-excitation block."""
     return SqueezeExcite(
-        activation=activation,
-        additive=additive,
-        rank=bottleneck_ratio,
+        activation=config.activation,
+        additive=config.additive,
+        rank=config.bottleneck_ratio,
     )(inputs)
 
 
@@ -958,4 +909,5 @@ __all__ = [
     "squeeze_excite",
     "name_func",
     "keras_func",
+    "BlockConfig",
 ]

@@ -120,18 +120,21 @@ class HiCTargetProcessor(TargetProcessor):
                 # Fetch raw Hi-C matrix
                 seq_hic = cool.matrix(balance=True).fetch(chrom_str)
 
-                # Handle NaN
+                # Handle NaN - interpolate missing values
+                from cooltools.lib.numutils import interp_nan, set_diag
+
                 seq_hic_nan = np.isnan(seq_hic)
+
+                # Interpolate NaN values before clipping (matching Basenji akita_data_read.py)
+                seq_hic = interp_nan(seq_hic)
 
                 # Clip diagonals
                 clipval = np.nanmedian(np.diag(seq_hic, self.diagonal_offset))
-                from cooltools.lib.numutils import set_diag
 
                 for i in range(-self.diagonal_offset + 1, self.diagonal_offset):
                     set_diag(seq_hic, clipval, i)
 
                 seq_hic = np.clip(seq_hic, 0, clipval)
-                seq_hic[seq_hic_nan] = np.nan
 
                 if self.as_obsexp:
                     from cooltools.lib.numutils import observed_over_expected
@@ -196,12 +199,3 @@ class HiCTargetProcessor(TargetProcessor):
         """
         with h5py.File(output_path, mode) as f:
             f.create_dataset("data", data=targets, chunks=(1024, -1), compression="gzip")
-
-
-@TargetProcessorRegistry.register("hic_triangular")
-class HiCTriangularTargetProcessor(HiCTargetProcessor):
-    """Alias for Hi-C triangular matrix processor."""
-
-    @property
-    def target_type(self) -> str:
-        return "hic_triangular"

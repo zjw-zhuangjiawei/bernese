@@ -1,13 +1,20 @@
 # Copyright 2026
 # Licensed under the Apache License, Version 2.0
-"""HDF5 data backend implementation.
+"""HDF5 data backend implementation - Modern v2.0+ format.
 
-This module provides HDF5-based storage with split organization.
-Sequences are loaded from pre-encoded genome.h5 using indices.
+This module provides high-performance HDF5-based storage with:
+- Flat file layout: {split}.h5 (e.g., train.h5, valid.h5)
+- Pre-loaded indices in memory
+- Sorted batch I/O for optimal throughput
+- Fixed-length strings (S16) for chromosomes
+- uint8 compression for genome storage
+- SWMR support for multi-process training
+- Strict mode (no silent zero fallback)
 """
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -24,87 +31,98 @@ from bernese.data.backends.base import (
 )
 
 
-class HDF5Backend:
-    """HDF5-based data backend with split organization.
+# Fixed-length string dtype for chromosome names (supports most standard chrom names)
+# "chr1" -> 4 chars, "chrM" -> 4 chars, "Chr1" -> 4 chars, max 16 is safe
+CHROM_DTYPE = "S16"
 
-    Expected folder structure:
+
+class HDF5Backend:
+    """High-performance HDF5-based data backend.
+
+    Expected folder structure (v2.0+ flat format):
         data_dir/
-        ├── manifest.json
-        ├── genome.h5              # Pre-encoded genome (chrom × 4)
-        ├── sequences/
-        │   ├── train/indices.h5    # (chrom_idx, start, end)
-        │   ├── valid/indices.h5
-        │   └── test/indices.h5
-        └── targets/
-            ├── train.h5
-            ├── valid.h5
-            └── test.h5
+        ├── manifest.json          # Version 2.0+ metadata
+        ├── genome.h5              # Pre-encoded genome (uint8, chrom × 4)
+        ├── train.h5               # Indices + targets for train split
+        ├── valid.h5               # Indices + targets for valid split
+        └── test.h5                # Indices + targets for test split
+
+    HDF5 internal structure for {split}.h5:
+        /indices/
+            /chrom    - Fixed-length strings (S16)
+            /start    - int32 array
+            /end      - int32 array
+        /targets/
+            /data     - float32 array (N, target_length, num_targets)
 
     Args:
         data_dir: Path to dataset directory
+        preload_indices: Whether to preload indices into memory (default: True)
+        strict_mode: If True, raise exceptions on missing data (default: True)
     """
 
     def __init__(
         self,
         data_dir: str | Path,
-        preload_sequences: bool = False,
+        preload_indices: bool = True,
+        strict_mode: bool = True,
     ):
         self.data_dir = Path(data_dir)
-        self.preload_sequences = preload_sequences
+        self.preload_indices = preload_indices
+        self.strict_mode = strict_mode
 
         # Load manifest
         manifest_path = self.data_dir / "manifest.json"
-        if manifest_path.exists():
-            self._metadata = DatasetMetadata.from_manifest(manifest_path)
-        else:
-            # Fallback: try to infer from legacy format
-            self._metadata = self._infer_metadata_legacy()
+        self._metadata = DatasetMetadata.from_manifest(manifest_path)
 
         # Track open file handles
-        self._genome_file = None
-        self._tgt_files: dict[str, h5py.File] = {}
-        self._coord_cache: dict[str, np.ndarray] = {}
+        self._genome_file: h5py.File | None = None
+        self._split_files: dict[str, h5py.File] = {}
 
-    def _infer_metadata_legacy(self) -> DatasetMetadata:
-        """Infer metadata from legacy format (statistics.json)."""
-        stats_file = self.data_dir / "sequences.h5"
-        if not stats_file.exists():
-            stats_file = self.data_dir.parent / "sequences.h5"
+        # Pre-loaded indices in memory (key optimization)
+        self._indices_cache: dict[str, dict[str, np.ndarray]] = {}
 
-        # Try to load from statistics.json
-        import json
+        # Preload indices if requested
+        if self.preload_indices:
+            self._preload_all_indices()
 
-        stats = {}
-        for name in ["statistics.json", "statistics_v2.json"]:
-            path = self.data_dir / name
-            if path.exists():
-                with open(path) as f:
-                    stats = json.load(f)
-                break
+    def _preload_all_indices(self) -> None:
+        """Pre-load all split indices into memory."""
+        for split in self._metadata.splits:
+            self._load_indices_to_memory(split)
 
-        # Build splits from stats
-        splits = {}
-        for split in ["train", "valid", "test"]:
-            key = f"{split}_seqs"
-            if key in stats and stats[key] > 0:
-                splits[split] = SplitMetadata(
-                    name=split,
-                    num_seqs=stats[key],
-                    coordinate_file=f"sequences/{split}/indices.h5",
-                    target_file=f"targets/{split}.h5",
-                )
+    def _load_indices_to_memory(self, split: str) -> None:
+        """Load indices for a split into memory."""
+        if split in self._indices_cache:
+            return
 
-        return DatasetMetadata(
-            version="1.0",
-            seq_length=stats.get("seq_length", 0),
-            seq_depth=stats.get("seq_depth", 4),
-            target_length=stats.get("target_length", 0),
-            num_targets=stats.get("num_targets", 0),
-            target_type="hic",
-            pool_width=stats.get("pool_width", 1),
-            diagonal_offset=stats.get("diagonal_offset", 2),
-            splits=splits,
-        )
+        split_info = self._metadata.splits[split]
+        split_file = self.data_dir / split_info.split_file
+
+        if split_file.exists():
+            with h5py.File(split_file, "r") as f:
+                if "indices" in f:
+                    indices_grp = f["indices"]
+
+                    # Load chrom (fixed-length strings)
+                    chrom_data = indices_grp["chrom"][:]
+                    if isinstance(chrom_data[0], bytes):
+                        # Fixed-length bytes, decode
+                        chroms = np.array(
+                            [c.decode("utf-8").strip() for c in chrom_data], dtype=object
+                        )
+                    elif isinstance(chrom_data[0], str):
+                        # Already strings
+                        chroms = np.array(list(chrom_data), dtype=object)
+                    else:
+                        # Integers - convert back to strings
+                        chroms = np.array([f"chr{i}" for i in chrom_data], dtype=object)
+
+                    self._indices_cache[split] = {
+                        "chrom": chroms,
+                        "start": indices_grp["start"][:].astype(np.int64),
+                        "end": indices_grp["end"][:].astype(np.int64),
+                    }
 
     @property
     def metadata(self) -> DatasetMetadata:
@@ -117,65 +135,52 @@ class HDF5Backend:
             return self._metadata.splits[split]
         raise ValueError(f"Unknown split: {split}")
 
-    def _ensure_genome_loaded(self) -> None:
-        """Load genome file if not already open."""
+    def _ensure_genome_open(self) -> None:
+        """Open genome file with SWMR support if not already open."""
         if self._genome_file is None:
             genome_file = self.data_dir / "genome.h5"
             if genome_file.exists():
-                self._genome_file = h5py.File(genome_file, "r")
+                # SWMR mode for multi-process reading
+                self._genome_file = h5py.File(genome_file, "r", libver="latest", swmr=True)
 
-    def _ensure_coord_loaded(self, split: str) -> None:
-        """Load coordinates into cache if not already loaded."""
-        if split in self._coord_cache:
-            return
-
-        split_info = self._get_split_info(split)
-        coord_file = self.data_dir / split_info.coordinate_file
-
-        if coord_file.exists():
-            with h5py.File(coord_file, "r") as f:
-                # Try new format with "chrom" (string names), fallback to "chrom_idx" (legacy)
-                if "chrom" in f:
-                    chrom_data = f["chrom"][:]
-                    # Handle both fixed-length and variable-length string types
-                    if isinstance(chrom_data, bytes):
-                        chroms = [c.decode("utf-8") for c in chrom_data]
-                    else:
-                        chroms = list(chrom_data)
-                    self._coord_cache[split] = {
-                        "chrom": np.array(chroms),
-                        "start": f["start"][:],
-                        "end": f["end"][:],
-                    }
-                elif "chrom_idx" in f:
-                    # Legacy format: convert integer indices to string representation
-                    self._coord_cache[split] = {
-                        "chrom": np.array([str(i) for i in f["chrom_idx"][:]]),
-                        "start": f["start"][:],
-                        "end": f["end"][:],
-                    }
-                else:
-                    # No chrom data found
-                    self._coord_cache[split] = {
-                        "chrom": np.array([]),
-                        "start": np.array([]),
-                        "end": np.array([]),
-                    }
-
-    def _ensure_target_file_open(self, split: str) -> None:
-        """Ensure target HDF5 file is open for split."""
-        if split not in self._tgt_files:
+    def _ensure_split_file_open(self, split: str) -> None:
+        """Open split HDF5 file with SWMR support."""
+        if split not in self._split_files:
             split_info = self._get_split_info(split)
-            tgt_file = self.data_dir / split_info.target_file
-            if tgt_file.exists():
-                self._tgt_files[split] = h5py.File(tgt_file, "r")
+            split_file = self.data_dir / split_info.split_file
+            if split_file.exists():
+                self._split_files[split] = h5py.File(split_file, "r", libver="latest", swmr=True)
+
+    def _sort_indices_for_io(
+        self, indices: np.ndarray, coords: dict[str, np.ndarray]
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Sort indices by chromosome and start position for optimal I/O.
+
+        Returns:
+            Tuple of (sorted_indices, original_order)
+        """
+        if len(indices) == 0:
+            return np.array([], dtype=np.int64), np.array([], dtype=np.int64)
+
+        # Get coordinates for requested indices
+        chroms = coords["chrom"][indices]
+        starts = coords["start"][indices]
+
+        # Create sorting key: (chrom, start)
+        # Convert chrom to Unicode string for zfill (np.char.zfill doesn't support object dtype)
+        chrom_keys = np.char.zfill(chroms.astype("U16"), 16)  # Pad for string sorting
+
+        # Sort by chrom first, then by start
+        sort_idx = np.lexsort((starts, chrom_keys))
+
+        return indices[sort_idx], sort_idx
 
     def get_sequences(
         self,
         split: str,
         indices: np.ndarray | list[int] | slice | None = None,
     ) -> torch.Tensor:
-        """Load sequences for a split.
+        """Load sequences for a split with sorted batch I/O.
 
         Args:
             split: Dataset split name (train/valid/test)
@@ -184,56 +189,92 @@ class HDF5Backend:
         Returns:
             Tensor of shape (batch, seq_length, seq_depth)
         """
-        self._ensure_coord_loaded(split)
-        self._ensure_genome_loaded()
+        # Ensure indices are loaded
+        if split not in self._indices_cache:
+            self._load_indices_to_memory(split)
 
-        if split not in self._coord_cache:
-            # No coordinates - return zeros
+        if split not in self._indices_cache:
+            # No data available
+            if self.strict_mode:
+                raise KeyError(f"No indices found for split: {split}")
             split_info = self._get_split_info(split)
             num = split_info.num_seqs if indices is None else len(indices)
             return torch.zeros(num, self._metadata.seq_length, self._metadata.seq_depth)
 
-        coords = self._coord_cache[split]
+        coords = self._indices_cache[split]
         seq_length = self._metadata.seq_length
         seq_depth = self._metadata.seq_depth
 
         # Normalize indices
         if indices is None:
-            idx = np.arange(coords["chrom"].shape[0])
+            idx = np.arange(coords["chrom"].shape[0], dtype=np.int64)
         else:
-            idx = np.asarray(indices)
+            idx = np.asarray(indices, dtype=np.int64)
 
-        # Extract sequences from pre-encoded genome
+        # Sort indices for optimal I/O
+        sorted_idx, sort_order = self._sort_indices_for_io(idx, coords)
+
+        # Extract sequences from genome
+        self._ensure_genome_open()
+
         seqs = []
         if self._genome_file is not None:
-            for i in idx:
-                chrom_name = coords["chrom"][i]
-                start = coords["start"][i]
-                end = coords["end"][i]
+            # Group by chromosome for batch reading
+            chrom_groups: dict[str, list[tuple[int, int, int]]] = {}
 
-                # Extract from genome.h5 - each chromosome is a separate dataset
-                # Dataset name is "chrom_{chrom_name}" (e.g., "chrom_chr1")
-                chrom_key = f"chrom_{chrom_name}"
-                if chrom_key in self._genome_file:
-                    chrom_seq = self._genome_file[chrom_key]
-                    # Extract region: (start:end, :), shape (seq_length, 4)
-                    region = chrom_seq[start:end, :]
-                    # Pad if needed
-                    if region.shape[0] < seq_length:
-                        padding = np.zeros((seq_length - region.shape[0], seq_depth), dtype=np.float32)
-                        region = np.vstack([region, padding])
-                    elif region.shape[0] > seq_length:
-                        region = region[:seq_length, :]
-                    seqs.append(region)  # (seq_length, 4)
+            for sorted_i, orig_idx in enumerate(sorted_idx):
+                chrom_name = str(coords["chrom"][orig_idx])
+                start = int(coords["start"][orig_idx])
+                end = int(coords["end"][orig_idx])
+
+                if chrom_name not in chrom_groups:
+                    chrom_groups[chrom_name] = []
+                chrom_groups[chrom_name].append((sorted_i, start, end))
+
+            # Read each chromosome contiguously
+            results = [None] * len(sorted_idx)
+
+            for chrom_name, regions in chrom_groups.items():
+                if chrom_name in self._genome_file:
+                    chrom_data = self._genome_file[chrom_name]
+
+                    for sorted_i, start, end in regions:
+                        region = chrom_data[start:end, :]
+
+                        # Handle length mismatches
+                        if region.shape[0] < seq_length:
+                            padding = np.zeros(
+                                (seq_length - region.shape[0], seq_depth), dtype=np.uint8
+                            )
+                            region = np.vstack([region, padding])
+                        elif region.shape[0] > seq_length:
+                            region = region[:seq_length, :]
+
+                        results[sorted_i] = region
                 else:
-                    # Chromosome not found - return zeros
-                    seqs.append(np.zeros((seq_length, seq_depth), dtype=np.float32))
-        else:
-            # No genome file - return zeros
-            for _ in idx:
-                seqs.append(np.zeros((seq_length, seq_depth), dtype=np.float32))
+                    # Chromosome not found in genome
+                    if self.strict_mode:
+                        raise KeyError(f"Chromosome {chrom_name} not found in genome.h5")
+                    for sorted_i, start, end in regions:
+                        results[sorted_i] = np.zeros((seq_length, seq_depth), dtype=np.uint8)
 
-        return torch.from_numpy(np.stack(seqs).astype(np.float32))
+            seqs = results
+        else:
+            # No genome file
+            if self.strict_mode:
+                raise FileNotFoundError("genome.h5 not found")
+            for _ in sorted_idx:
+                seqs.append(np.zeros((seq_length, seq_depth), dtype=np.uint8))
+
+        # Convert to tensor and restore original order
+        seqs_tensor = torch.from_numpy(np.stack(seqs).astype(np.float32))
+
+        # Restore original order
+        if len(sort_order) > 0:
+            inverse_order = np.argsort(sort_order)
+            seqs_tensor = seqs_tensor[inverse_order]
+
+        return seqs_tensor
 
     def get_targets(
         self,
@@ -250,27 +291,30 @@ class HDF5Backend:
             Tensor of shape (batch, target_length, num_targets)
         """
         split_info = self._get_split_info(split)
-        self._ensure_target_file_open(split)
+        self._ensure_split_file_open(split)
 
-        if split not in self._tgt_files:
-            # Return zeros if no targets file
+        if split not in self._split_files:
+            if self.strict_mode:
+                raise KeyError(f"No target file found for split: {split}")
             num = split_info.num_seqs if indices is None else len(indices)
             return torch.zeros(num, self._metadata.target_length, self._metadata.num_targets)
 
-        with h5py.File(self._tgt_files[split].filename, "r") as f:
-            # Try different dataset names
-            for ds_name in ["data", "targets"]:
-                if ds_name in f:
-                    ds = f[ds_name]
-                    if indices is not None:
-                        data = ds[indices]
-                    else:
-                        data = ds[:]
-                    return torch.from_numpy(data.astype(np.float32))
+        # Read from split file
+        with h5py.File(self._split_files[split].filename, "r") as f:
+            if "targets" not in f or "data" not in f["targets"]:
+                if self.strict_mode:
+                    raise KeyError(f"No targets data found in {split_info.split_file}")
+                num = split_info.num_seqs if indices is None else len(indices)
+                return torch.zeros(num, self._metadata.target_length, self._metadata.num_targets)
 
-        # Fallback: zeros
-        num = split_info.num_seqs if indices is None else len(indices)
-        return torch.zeros(num, self._metadata.target_length, self._metadata.num_targets)
+            targets_ds = f["targets"]["data"]
+
+            if indices is not None:
+                data = targets_ds[indices]
+            else:
+                data = targets_ds[:]
+
+        return torch.from_numpy(data.astype(np.float32))
 
     def get_coordinates(
         self,
@@ -286,12 +330,14 @@ class HDF5Backend:
         Returns:
             List of (chrom, start, end) tuples
         """
-        self._ensure_coord_loaded(split)
+        # Ensure indices are loaded
+        if split not in self._indices_cache:
+            self._load_indices_to_memory(split)
 
-        if split not in self._coord_cache:
+        if split not in self._indices_cache:
             return []
 
-        coords = self._coord_cache[split]
+        coords = self._indices_cache[split]
 
         # Normalize indices
         if indices is None:
@@ -303,20 +349,36 @@ class HDF5Backend:
             (str(coords["chrom"][i]), int(coords["start"][i]), int(coords["end"][i])) for i in idx
         ]
 
+    @contextmanager
+    def open(self):
+        """Context manager for proper file handle management."""
+        try:
+            yield self
+        finally:
+            self.close()
+
     def close(self) -> None:
         """Close all open file handles."""
         if self._genome_file is not None:
             self._genome_file.close()
             self._genome_file = None
 
-        for f in self._tgt_files.values():
+        for f in self._split_files.values():
             f.close()
-        self._tgt_files.clear()
+        self._split_files.clear()
 
-        self._coord_cache.clear()
+        # Keep indices in memory (they're small)
 
     def __del__(self):
         """Cleanup on deletion."""
+        self.close()
+
+    def __enter__(self):
+        """Enter context manager."""
+        return self
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        """Exit context manager."""
         self.close()
 
     def __len__(self) -> int:
@@ -329,25 +391,23 @@ class HDF5Backend:
 
 
 class HDF5Writer:
-    """HDF5-based data writer for creating datasets in v2 format.
+    """HDF5-based data writer for creating datasets in v2.0+ flat format.
 
     This class handles writing genomic datasets with:
-    - Pre-encoded genome (genome.h5)
-    - Sequence indices (chrom_idx, start, end)
-    - Target arrays per split
+    - Flat file layout: {split}.h5
+    - Pre-encoded genome (uint8, compressed)
+    - Fixed-length strings for chromosomes
+    - Sorted indices for optimal I/O
     - Manifest.json creation
 
     Example:
         writer = HDF5Writer("output_dir")
 
-        # Write pre-encoded genome
-        writer.write_genome(genome_1hot, chrom_lengths)
+        # Write pre-encoded genome (uint8)
+        writer.write_genome(genome_1hot)
 
-        # Write indices
-        writer.write_indices("train", chrom_indices, starts, ends)
-
-        # Write targets
-        writer.write_targets("train", targets)
+        # Write split (indices + targets in one file)
+        writer.write_split("train", chrom_names, starts, ends, targets)
 
         # Finalize
         writer.finalize(...)
@@ -369,7 +429,7 @@ class HDF5Writer:
 
         # Track what has been written
         self._splits_written: set[str] = set()
-        self._chrom_lengths: dict[int, int] = {}
+        self._chrom_lengths: dict[str, int] = {}
 
         # Create directory structure
         self._create_directories()
@@ -378,68 +438,199 @@ class HDF5Writer:
         """Create output directory structure."""
         self.output_dir.mkdir(parents=True, exist_ok=True)
 
-        for split in ["train", "valid", "test"]:
-            (self.output_dir / "sequences" / split).mkdir(parents=True, exist_ok=True)
+    def write_chromosome(self, chrom_name: str, dna_seq: str) -> None:
+        """Stream one chromosome directly to HDF5 with uint8 compression.
 
-        (self.output_dir / "targets").mkdir(parents=True, exist_ok=True)
+        This method performs one-hot encoding internally and writes immediately,
+        avoiding memory accumulation of the entire genome.
+
+        Args:
+            chrom_name: Chromosome name (e.g., "chr1", "chr2")
+            dna_seq: Raw DNA sequence string (ACGTN characters)
+        """
+        genome_file = self.output_dir / "genome.h5"
+
+        # One-hot encode: A=0, C=1, G=2, T=3, N=0
+        seq_upper = dna_seq.upper()
+        seq_length = len(seq_upper)
+
+        # Pre-allocate uint8 array (4 channels)
+        seq_1hot = np.zeros((seq_length, 4), dtype=np.uint8)
+
+        # Vectorized encoding using lookup
+        for i, char in enumerate(seq_upper):
+            if char == "A":
+                seq_1hot[i, 0] = 1
+            elif char == "C":
+                seq_1hot[i, 1] = 1
+            elif char == "G":
+                seq_1hot[i, 2] = 1
+            elif char == "T":
+                seq_1hot[i, 3] = 1
+            # N stays as all zeros (background)
+
+        # Write to file in append mode
+        with h5py.File(genome_file, "a") as f:
+            # Set attributes on first write
+            if "version" not in f.attrs:
+                f.attrs["version"] = "2.0"
+                f.attrs["seq_length"] = self.seq_length
+                f.attrs["seq_depth"] = self.seq_depth
+                f.attrs["dtype"] = "uint8"
+
+            chrom_key = str(chrom_name)
+            if chrom_key in f:
+                del f[chrom_key]
+
+            f.create_dataset(
+                chrom_key,
+                data=seq_1hot,
+                compression="gzip",
+                compression_opts=4,
+            )
+
+        self._chrom_lengths[chrom_name] = seq_length
 
     def write_genome(
         self,
         genome_dict: dict[str, np.ndarray],
     ) -> None:
-        """Write pre-encoded genome to HDF5.
+        """Write pre-encoded genome to HDF5 with uint8 compression.
 
         Args:
             genome_dict: Dictionary mapping chrom_name to 1hot encoded array (length × 4)
                           e.g., {"chr1": array, "chr2": array, ...}
+
+        Note: For large genomes, prefer using write_chromosome() in streaming mode
+              to avoid memory accumulation.
         """
         genome_file = self.output_dir / "genome.h5"
 
         with h5py.File(genome_file, "w") as f:
+            # Store metadata in file attributes
+            f.attrs["version"] = "2.0"
+            f.attrs["seq_length"] = self.seq_length
+            f.attrs["seq_depth"] = self.seq_depth
+            f.attrs["dtype"] = "uint8"
+
             for chrom_name, seq_1hot in genome_dict.items():
-                # Store with "chrom_" prefix: "chrom_chr1", "chrom_chr2", etc.
-                chrom_key = f"chrom_{chrom_name}"
-                f.create_dataset(chrom_key, data=seq_1hot, compression="gzip")
+                # Convert to uint8 for 75% space savings
+                if seq_1hot.dtype != np.uint8:
+                    seq_1hot = (seq_1hot * 255).astype(np.uint8)
+
+                chrom_key = str(chrom_name)
+                f.create_dataset(chrom_key, data=seq_1hot, compression="gzip", compression_opts=4)
                 self._chrom_lengths[chrom_name] = seq_1hot.shape[0]
 
-    def write_indices(
+    def write_split(
         self,
         split: str,
         chrom_names: list[str],
         starts: list[int],
         ends: list[int],
+        targets: np.ndarray | None = None,
+        chunk_size: int = 1024,
     ) -> None:
-        """Write sequence indices for a split.
+        """Write indices and targets for a split in a single flat file.
 
         Args:
             split: Split name (train/valid/test)
             chrom_names: List of chromosome names (e.g., "chr1", "chr2")
             starts: List of start positions
             ends: List of end positions
+            targets: Array of shape (num_seqs, target_length, num_targets), or None
+            chunk_size: HDF5 chunk size for targets
         """
-        coord_file = self.output_dir / "sequences" / split / "indices.h5"
+        split_file = self.output_dir / f"{split}.h5"
 
-        with h5py.File(coord_file, "w") as f:
-            # Store chromosome names as strings (variable-length UTF-8)
-            dt = h5py.string_dtype()
-            f.create_dataset("chrom", data=np.array(chrom_names, dtype=dt))
-            f.create_dataset("start", data=np.array(starts, dtype=np.int32))
-            f.create_dataset("end", data=np.array(ends, dtype=np.int32))
+        num_seqs = len(chrom_names)
+
+        # Sort by chromosome and start position for optimal I/O
+        sorted_data = self._sort_by_chrom_start(chrom_names, starts, ends, targets)
+        sorted_chroms = sorted_data["chroms"]
+        sorted_starts = sorted_data["starts"]
+        sorted_ends = sorted_data["ends"]
+        sorted_targets = sorted_data["targets"]
+
+        with h5py.File(split_file, "w") as f:
+            # Write indices group
+            indices_grp = f.create_group("indices")
+
+            # Fixed-length strings (S16) for better performance
+            chrom_array = np.array(sorted_chroms, dtype=object)
+            # Pad strings to fixed length
+            padded_chroms = np.array(
+                [c.encode("utf-8").ljust(16, b"\x00") for c in chrom_array], dtype=CHROM_DTYPE
+            )
+            indices_grp.create_dataset("chrom", data=padded_chroms)
+            indices_grp.create_dataset("start", data=np.array(sorted_starts, dtype=np.int32))
+            indices_grp.create_dataset("end", data=np.array(sorted_ends, dtype=np.int32))
+
+            # Write targets if provided
+            if sorted_targets is not None:
+                targets_grp = f.create_group("targets")
+
+                # Adapt chunk size to data size
+                actual_chunk_size = min(chunk_size, sorted_targets.shape[0])
+
+                targets_grp.create_dataset(
+                    "data",
+                    data=sorted_targets.astype(np.float32),
+                    chunks=(actual_chunk_size, self.target_length, self.num_targets),
+                    compression="gzip",
+                    compression_opts=4,
+                )
 
         self._splits_written.add(split)
+
+    def _sort_by_chrom_start(
+        self,
+        chrom_names: list[str],
+        starts: list[int],
+        ends: list[int],
+        targets: np.ndarray | None = None,
+    ) -> dict:
+        """Sort data by chromosome and start position.
+
+        Returns:
+            Dictionary with sorted chroms, starts, ends, and targets
+        """
+        # Create index array
+        idx = np.arange(len(chrom_names))
+
+        # Sort by chrom first, then by start
+        sorted_idx = sorted(idx, key=lambda i: (chrom_names[i].lower(), starts[i]))
+        sorted_idx = np.array(sorted_idx, dtype=np.int64)
+
+        # Apply sorting
+        sorted_chroms = [chrom_names[i] for i in sorted_idx]
+        sorted_starts = [starts[i] for i in sorted_idx]
+        sorted_ends = [ends[i] for i in sorted_idx]
+
+        sorted_targets = None
+        if targets is not None:
+            sorted_targets = targets[sorted_idx]
+
+        return {
+            "chroms": sorted_chroms,
+            "starts": sorted_starts,
+            "ends": sorted_ends,
+            "targets": sorted_targets,
+        }
 
     def write_coordinates(
         self,
         split: str,
         coordinates: list[tuple[str, int, int]],
+        targets: np.ndarray | None = None,
     ) -> None:
-        """Write genomic coordinates for a split.
+        """Write genomic coordinates and targets for a split.
 
         Args:
             split: Split name (train/valid/test)
             coordinates: List of (chrom, start, end) tuples
+            targets: Optional target array
         """
-        # Extract chromosome names directly from coordinates
         chrom_names = []
         starts = []
         ends = []
@@ -449,58 +640,7 @@ class HDF5Writer:
             starts.append(start)
             ends.append(end)
 
-        self.write_indices(split, chrom_names, starts, ends)
-
-    def write_sequences(
-        self,
-        split: str,
-        sequences: np.ndarray,
-        chunk_size: int = 256,
-    ) -> None:
-        """Write pre-extracted sequences for a split (legacy compatibility).
-
-        Args:
-            split: Split name
-            sequences: Array of shape (num_seqs, seq_depth, seq_length)
-            chunk_size: HDF5 chunk size
-        """
-        # This is kept for backward compatibility but deprecated
-        # New code should use write_genome + write_indices
-        seq_file = self.output_dir / "sequences" / split / "data.h5"
-
-        with h5py.File(seq_file, "w") as f:
-            f.create_dataset(
-                "data",
-                data=sequences.astype(np.float32),
-                chunks=(chunk_size, self.seq_depth, self.seq_length),
-                compression="gzip",
-            )
-
-    def write_targets(
-        self,
-        split: str,
-        targets: np.ndarray,
-        chunk_size: int = 1024,
-    ) -> None:
-        """Write targets for a split.
-
-        Args:
-            split: Split name
-            targets: Array of shape (num_seqs, target_length, num_targets)
-            chunk_size: HDF5 chunk size (will be reduced if smaller than data)
-        """
-        tgt_file = self.output_dir / "targets" / f"{split}.h5"
-
-        # Adapt chunk size to data size for small datasets
-        actual_chunk_size = min(chunk_size, targets.shape[0])
-
-        with h5py.File(tgt_file, "w") as f:
-            f.create_dataset(
-                "data",
-                data=targets.astype(np.float32),
-                chunks=(actual_chunk_size, self.target_length, self.num_targets),
-                compression="gzip",
-            )
+        self.write_split(split, chrom_names, starts, ends, targets)
 
     def finalize(
         self,
@@ -524,36 +664,25 @@ class HDF5Writer:
         """
         import json
 
-        # Build splits
+        # Build splits with flat file format
         splits = {}
         for split in self._splits_written:
-            splits[split] = SplitMetadata(
-                name=split,
-                num_seqs=0,  # Will be updated when indices are written
-                coordinate_file=f"sequences/{split}/indices.h5",
-                target_file=f"targets/{split}.h5",
-            )
+            split_file = self.output_dir / f"{split}.h5"
 
-        # Update num_seqs from indices files
-        for split in splits:
-            coord_file = self.output_dir / splits[split].coordinate_file
-            if coord_file.exists():
-                with h5py.File(coord_file, "r") as f:
-                    # Try new format "chrom", fallback to legacy "chrom_idx"
-                    if "chrom" in f:
-                        num_seqs = f["chrom"].shape[0]
-                    elif "chrom_idx" in f:
-                        num_seqs = f["chrom_idx"].shape[0]
+            if split_file.exists():
+                with h5py.File(split_file, "r") as f:
+                    if "indices" in f and "chrom" in f["indices"]:
+                        num_seqs = f["indices"]["chrom"].shape[0]
                     else:
                         num_seqs = 0
+
                     splits[split] = SplitMetadata(
                         name=split,
                         num_seqs=num_seqs,
-                        coordinate_file=splits[split].coordinate_file,
-                        target_file=splits[split].target_file,
+                        split_file=f"{split}.h5",
                     )
 
-        # Build targets (file paths no longer stored)
+        # Build targets
         targets = []
         if target_info:
             for i, info in enumerate(target_info):

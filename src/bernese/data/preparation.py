@@ -17,7 +17,7 @@ import numpy as np
 import pandas as pd
 import pysam
 
-from bernese.data.dataset import DatasetWriter
+from bernese.data.backends import HDF5Writer
 from bernese.data.targets import TargetProcessorRegistry
 
 
@@ -46,7 +46,7 @@ class PreparationConfig:
 
     # Block-based region creation
     block_size: int = 1048576  # 1 Mb
-    join_blocks: bool = True    # Join adjacent blocks after splitting
+    join_blocks: bool = True  # Join adjacent blocks after splitting
 
     # Stride parameters
     stride_train: float = 1.0
@@ -90,7 +90,7 @@ class DataPreparator:
         self.target_length = self._calculate_target_length()
 
         # Create writer
-        self.writer = DatasetWriter(
+        self.writer = HDF5Writer(
             output_dir=self.output_dir,
             seq_length=self.config.seq_length,
             seq_depth=4,
@@ -117,30 +117,25 @@ class DataPreparator:
         Returns:
             DatasetMetadata for the prepared dataset
         """
-        # Step 1: Pre-encode entire genome to 1hot
+        # Step 1: Pre-encode entire genome to 1hot (streaming)
         print("Pre-encoding genome...")
         self._preencode_genome()
 
-        # Step 2: Load genome and create sequence coordinates
-        print("Creating sequence regions...")
-        regions_by_split = self._create_sequence_regions()
+        # Step 2: Create sequence coordinates and extract targets
+        # This is now combined into a single atomic write per split
+        print("Creating regions and extracting targets...")
+        self._extract_targets_and_write()
 
-        # Step 3: Write indices using DatasetWriter
-        print("Writing indices...")
-        self._write_indices(regions_by_split)
-
-        # Step 4: Extract targets using target processors
-        print("Extracting targets...")
-        self._extract_targets(regions_by_split)
-
-        # Step 5: Finalize (creates manifest.json)
+        # Step 3: Finalize (creates manifest.json)
         print("Creating manifest...")
         target_info = []
         for ti, row in self.targets_df.iterrows():
-            target_info.append({
-                "name": row.get("name", f"target_{ti}"),
-                "clip": row.get("clip"),
-            })
+            target_info.append(
+                {
+                    "name": row.get("name", f"target_{ti}"),
+                    "clip": row.get("clip"),
+                }
+            )
 
         metadata = self.writer.finalize(
             genome_name=self.fasta_file.stem,
@@ -154,81 +149,81 @@ class DataPreparator:
         return metadata
 
     def _preencode_genome(self) -> None:
-        """Pre-encode entire genome to 1hot and save to genome.h5."""
+        """Stream one chromosome at a time to genome.h5.
+
+        This method fetches each chromosome, encodes it internally in HDF5Writer,
+        and immediately releases memory - avoiding OOM for large genomes.
+        """
         # Open FASTA file
         fasta = pysam.FastaFile(str(self.fasta_file))
 
         try:
-            genome_dict = {}
-
-            # Build chromosome mapping using names (not indices)
+            # Stream each chromosome directly to HDF5
             for chrom, length in zip(fasta.references, fasta.lengths):
                 print(f"  Encoding {chrom} ({length} bp)")
 
-                # Fetch sequence
+                # Fetch sequence (string)
                 seq_dna = fasta.fetch(chrom)
 
-                # One-hot encode
-                seq_1hot = self._dna_1hot_full(seq_dna)
-                # Use chromosome name as key (e.g., "chr1", "chr2")
-                genome_dict[chrom] = seq_1hot
+                # Write directly to HDF5 (encoding happens inside writer)
+                self.writer.write_chromosome(chrom, seq_dna)
 
-            # Write to genome.h5
-            self.writer.write_genome(genome_dict)
+                # Memory is released after each iteration
 
         finally:
             fasta.close()
 
-    def _write_indices(self, regions_by_split: dict[str, list[GenomicRegion]]) -> None:
-        """Write sequence indices for each split."""
+    def _extract_targets_and_write(self) -> None:
+        """Create sequence regions, extract targets, and write atomically.
+
+        This combines region creation, target extraction, and writing into a single
+        pass per split using write_split() for atomic operation.
+        """
+        # Step 1: Create sequence regions
+        regions_by_split = self._create_sequence_regions()
+
+        # Step 2: Get target processor
+        processor = TargetProcessorRegistry.create(
+            self.config.target_type,
+            pool_width=self.config.pool_width,
+            diagonal_offset=self.config.diagonal_offset,
+            crop_bp=self.config.crop_bp,
+        )
+
+        # Step 3: Process each split atomically
         for split, regions in regions_by_split.items():
             if len(regions) == 0:
                 continue
 
+            print(f"  Processing {split}: {len(regions)} regions")
+
+            # Extract coordinates
             chrom_names = []
             starts = []
             ends = []
 
             for region in regions:
-                # Use chromosome name directly
                 chrom_names.append(region.chrom)
                 starts.append(region.start)
                 ends.append(region.end)
 
-            self.writer.write_indices(split, chrom_names, starts, ends)
+            # Convert regions to tuple format for target processor
+            region_tuples = [(r.chrom, r.start, r.end) for r in regions]
 
-    def _dna_1hot_full(self, seq: str) -> np.ndarray:
-        """One-hot encode full DNA sequence (no padding)."""
-        seq = seq.upper().replace("A", "0").replace("C", "1")
-        seq = seq.replace("G", "2").replace("T", "3").replace("N", "0")
+            # Process each target
+            all_targets = []
+            for ti, target_row in self.targets_df.iterrows():
+                target_file = target_row["file"]
 
-        seq_1hot = np.zeros((len(seq), 4), dtype=np.float32)
-        for i, c in enumerate(seq):
-            ci = ord(c) - ord("0")
-            if 0 <= ci <= 3:
-                seq_1hot[i, ci] = 1.0
+                # Process
+                targets = processor.process(target_file, region_tuples)
+                all_targets.append(targets)
 
-        return seq_1hot
+            # Stack targets: (num_targets, num_seqs, target_length) -> (num_seqs, target_length, num_targets)
+            targets_stacked = np.stack(all_targets, axis=-1)
 
-    def _dna_1hot(self, seq: str) -> np.ndarray:
-        """One-hot encode DNA sequence with padding."""
-        seq = seq.upper().replace("A", "0").replace("C", "1")
-        seq = seq.replace("G", "2").replace("T", "3").replace("N", "0")
-
-        seq_1hot = np.zeros((len(seq), 4), dtype=np.float32)
-        for i, c in enumerate(seq):
-            ci = ord(c) - ord("0")
-            if 0 <= ci <= 3:
-                seq_1hot[i, ci] = 1.0
-
-        # Handle length mismatch
-        if seq_1hot.shape[0] < self.config.seq_length:
-            padding = np.zeros((self.config.seq_length - seq_1hot.shape[0], 4), dtype=np.float32)
-            seq_1hot = np.vstack([seq_1hot, padding])
-        elif seq_1hot.shape[0] > self.config.seq_length:
-            seq_1hot = seq_1hot[: self.config.seq_length, :]
-
-        return seq_1hot
+            # Atomic write using write_split (indices + targets in one file)
+            self.writer.write_split(split, chrom_names, starts, ends, targets_stacked)
 
     def _load_genome(self) -> dict[str, int]:
         """Load genome chromosome sizes."""
@@ -239,7 +234,7 @@ class DataPreparator:
 
     def _create_sequence_regions(self) -> dict[str, list[GenomicRegion]]:
         """Create sequence regions for each split.
-        
+
         Uses block-based approach:
         1. Divide genome into fixed-size blocks (block_size, default 1 Mb)
         2. Split blocks into train/valid/test
@@ -255,7 +250,7 @@ class DataPreparator:
         # Create fixed-size blocks
         print(f"  Creating blocks of size {self.config.block_size}...")
         blocks = self._create_genomic_blocks(chrom_sizes)
-        
+
         # Filter for minimum length
         blocks = [b for b in blocks if b.end - b.start >= seq_length]
         print(f"  After length filter: {len(blocks)} blocks")
@@ -303,14 +298,14 @@ class DataPreparator:
 
     def _create_genomic_blocks(self, chrom_sizes: dict[str, int]) -> list[Contig]:
         """Divide genome into fixed-size blocks.
-        
+
         Creates non-overlapping blocks of block_size (default 1 Mb) from each chromosome.
         This ensures blocks are substantially larger than sequence length to preserve
         local genomic structure and prevent information leakage.
-        
+
         Args:
             chrom_sizes: Dictionary mapping chromosome name to length
-            
+
         Returns:
             List of Contig objects representing fixed-size blocks
         """
@@ -324,7 +319,7 @@ class DataPreparator:
             remainder = length - pos
             if remainder >= self.config.seq_length - 2 * self.config.crop_bp:
                 blocks.append(Contig(chrom, pos, length))
-        
+
         print(f"  Created {len(blocks)} blocks of size {self.config.block_size}")
         return blocks
 
@@ -395,9 +390,9 @@ class DataPreparator:
                 test_contigs.append(ctg)
                 test_nt += ctg_len
 
-        print(f"  Train: {len(train_contigs)} contigs, {train_nt} nt ({train_nt/total_nt:.4f})")
-        print(f"  Valid: {len(valid_contigs)} contigs, {valid_nt} nt ({valid_nt/total_nt:.4f})")
-        print(f"  Test:  {len(test_contigs)} contigs, {test_nt} nt ({test_nt/total_nt:.4f})")
+        print(f"  Train: {len(train_contigs)} contigs, {train_nt} nt ({train_nt / total_nt:.4f})")
+        print(f"  Valid: {len(valid_contigs)} contigs, {valid_nt} nt ({valid_nt / total_nt:.4f})")
+        print(f"  Test:  {len(test_contigs)} contigs, {test_nt} nt ({test_nt / total_nt:.4f})")
 
         return [train_contigs, valid_contigs, test_contigs]
 
@@ -451,42 +446,6 @@ class DataPreparator:
                 seq_end += int(stride)
 
         return regions
-
-    def _extract_targets(self, regions_by_split: dict[str, list[GenomicRegion]]) -> None:
-        """Extract targets for all regions using DatasetWriter."""
-        # Get target processor with crop_bp parameter
-        # Crop is applied only to targets (e.g., Hi-C matrix), not to sequences
-        processor = TargetProcessorRegistry.create(
-            self.config.target_type,
-            pool_width=self.config.pool_width,
-            diagonal_offset=self.config.diagonal_offset,
-            crop_bp=self.config.crop_bp,
-        )
-
-        # Process each split
-        for split, regions in regions_by_split.items():
-            if len(regions) == 0:
-                continue
-
-            print(f"  Processing {split}: {len(regions)} regions")
-
-            # Convert regions to tuple format
-            region_tuples = [(r.chrom, r.start, r.end) for r in regions]
-
-            # Process each target
-            all_targets = []
-            for ti, target_row in self.targets_df.iterrows():
-                target_file = target_row["file"]
-
-                # Process
-                targets = processor.process(target_file, region_tuples)
-                all_targets.append(targets)
-
-            # Stack targets: (num_targets, num_seqs, target_length) -> (num_seqs, target_length, num_targets)
-            targets_stacked = np.stack(all_targets, axis=-1)
-
-            # Write using DatasetWriter
-            self.writer.write_targets(split, targets_stacked)
 
 
 def prepare_dataset(
