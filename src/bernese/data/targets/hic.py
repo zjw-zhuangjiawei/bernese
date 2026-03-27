@@ -13,6 +13,7 @@ from typing import Any
 import h5py
 import numpy as np
 
+from bernese.data.targets.pool import PoolStat
 from bernese.data.targets.registry import TargetProcessor, TargetProcessorRegistry
 
 
@@ -28,6 +29,7 @@ class HiCTargetProcessor(TargetProcessor):
     def __init__(
         self,
         pool_width: int = 128,
+        pool_stat: PoolStat = PoolStat.MEAN,
         diagonal_offset: int = 2,
         as_obsexp: bool = False,
         global_obsexp: bool = False,
@@ -36,6 +38,7 @@ class HiCTargetProcessor(TargetProcessor):
         crop_bp: int = 0,
     ):
         self.pool_width = pool_width
+        self.pool_stat = pool_stat
         self.diagonal_offset = diagonal_offset
         self.as_obsexp = as_obsexp
         self.global_obsexp = global_obsexp
@@ -68,6 +71,38 @@ class HiCTargetProcessor(TargetProcessor):
         # Compute triangular size
         return seq_len_nodiag * (seq_len_nodiag + 1) // 2
 
+    def _aggregate(self, values: np.ndarray, stat: PoolStat | None = None) -> float:
+        """Apply pooling aggregation.
+
+        Args:
+            values: Array of values to aggregate
+            stat: PoolStat to use (defaults to self.pool_stat)
+
+        Returns:
+            Aggregated value
+        """
+        if stat is None:
+            stat = self.pool_stat
+
+        match stat:
+            case PoolStat.SUM:
+                return float(np.sum(values)) if len(values) > 0 else 0.0
+            case PoolStat.SUM_SQRT:
+                return -1 + np.sqrt(1 + np.sum(values)) if len(values) > 0 else 0.0
+            case PoolStat.MEAN:
+                return float(np.mean(values)) if len(values) > 0 else 0.0
+            case PoolStat.MEAN_SQRT:
+                return -1 + np.sqrt(1 + np.mean(values)) if len(values) > 0 else 0.0
+            case PoolStat.MEDIAN:
+                return float(np.median(values)) if len(values) > 0 else 0.0
+            case PoolStat.MAX:
+                return float(np.max(values)) if len(values) > 0 else 0.0
+            case PoolStat.MIN:
+                return float(np.min(values)) if len(values) > 0 else 0.0
+            case PoolStat.PEAK:
+                mean_val = np.mean(values) if len(values) > 0 else 0.0
+                return float(np.clip(np.sqrt(mean_val * 4), 0, 1))
+
     def process(
         self,
         input_file: str,
@@ -88,6 +123,9 @@ class HiCTargetProcessor(TargetProcessor):
 
         # Open cooler
         cool = cooler.Cooler(input_file)
+
+        # Get cooler binsize
+        cool_binsize = cool.binsize
 
         # Check for chr prefix
         has_chr_prefix = "chr1" in cool.chromnames
@@ -117,7 +155,7 @@ class HiCTargetProcessor(TargetProcessor):
                 else:
                     chrom_str = f"{chrom[3:] if chrom.startswith('chr') else chrom}:{start}-{end}"
 
-                # Fetch raw Hi-C matrix
+                # Fetch raw Hi-C matrix at native resolution
                 seq_hic = cool.matrix(balance=True).fetch(chrom_str)
 
                 # Handle NaN - interpolate missing values
@@ -125,7 +163,7 @@ class HiCTargetProcessor(TargetProcessor):
 
                 seq_hic_nan = np.isnan(seq_hic)
 
-                # Interpolate NaN values before clipping (matching Basenji akita_data_read.py)
+                # Interpolate NaN values before clipping
                 seq_hic = interp_nan(seq_hic)
 
                 # Clip diagonals
@@ -151,6 +189,30 @@ class HiCTargetProcessor(TargetProcessor):
                         if self.clip is not None:
                             seq_hic_obsexp = np.clip(seq_hic_obsexp, 0, self.clip)
 
+                    seq_hic = seq_hic_obsexp
+
+                # Pool the 2D matrix if cooler binsize differs from pool_width
+                if cool_binsize is not None and cool_binsize != self.pool_width:
+                    # Compute binning factor
+                    pool_factor = self.pool_width // cool_binsize
+                    if pool_factor > 1:
+                        # Reshape and pool the matrix
+                        orig_len = seq_hic.shape[0]
+                        pooled_len = orig_len // pool_factor
+                        if pooled_len > 0:
+                            # Reshape to (pooled_len, pool_factor, pooled_len, pool_factor)
+                            # and pool along the factor dimensions
+                            seq_hic = seq_hic[
+                                : pooled_len * pool_factor, : pooled_len * pool_factor
+                            ].reshape(
+                                pooled_len,
+                                pool_factor,
+                                pooled_len,
+                                pool_factor,
+                            )
+                            # Apply pooling aggregation
+                            seq_hic = self._pool_2d(seq_hic)
+
                 # Unroll upper triangular
                 seq_hic = seq_hic[triu_tup]
                 targets[ri] = seq_hic.astype(np.float32)
@@ -161,6 +223,34 @@ class HiCTargetProcessor(TargetProcessor):
                 targets[ri] = 0
 
         return targets
+
+    def _pool_2d(self, matrix: np.ndarray) -> np.ndarray:
+        """Pool 2D matrix using pool_stat.
+
+        Args:
+            matrix: 4D array of shape (rows, pool_factor, cols, pool_factor)
+
+        Returns:
+            2D pooled matrix
+        """
+        # Pool along both dimensions: (rows, cols)
+        if self.pool_stat == PoolStat.SUM:
+            return np.sum(matrix, axis=(1, 3))
+        elif self.pool_stat == PoolStat.MEAN:
+            return np.mean(matrix, axis=(1, 3))
+        elif self.pool_stat == PoolStat.MEDIAN:
+            return np.median(matrix, axis=(1, 3))
+        elif self.pool_stat == PoolStat.MAX:
+            return np.max(matrix, axis=(1, 3))
+        elif self.pool_stat == PoolStat.MIN:
+            return np.min(matrix, axis=(1, 3))
+        elif self.pool_stat == PoolStat.SUM_SQRT:
+            return -1 + np.sqrt(1 + np.sum(matrix, axis=(1, 3)))
+        elif self.pool_stat == PoolStat.MEAN_SQRT:
+            return -1 + np.sqrt(1 + np.mean(matrix, axis=(1, 3)))
+        else:
+            # Default to mean
+            return np.mean(matrix, axis=(1, 3))
 
     def compute_statistics(self, data: np.ndarray) -> dict[str, Any]:
         """Compute statistics for Hi-C data.

@@ -69,14 +69,14 @@ class GenomicDataset(Dataset):
     def __len__(self) -> int:
         return self.num_seqs
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Get a single sample.
 
         Args:
             idx: Sample index (in shuffled order if shuffle=True)
 
         Returns:
-            Tuple of (sequence, targets) tensors
+            Tuple of (sequence, targets_list) where targets_list is a list of tensors
         """
         # Map to original index
         if self.shuffle:
@@ -96,17 +96,27 @@ class GenomicDataset(Dataset):
                 self._seq_cache[orig_idx] = seq
 
         if orig_idx in self._tgt_cache:
-            targets = self._tgt_cache[orig_idx]
+            targets_list = self._tgt_cache[orig_idx]
         else:
-            targets = self.backend.get_targets(self.split, [orig_idx])[0]
+            # Load all targets (list of tensors)
+            targets_list = self.backend.get_targets(self.split, [orig_idx])
+
+            # targets_list is list[Tensor], each Tensor shape: (1, target_length_i)
+            # Squeeze to (target_length_i,)
+            targets_list = [t.squeeze(0) for t in targets_list]
 
             if len(self._tgt_cache) < self._cache_size:
-                self._tgt_cache[orig_idx] = targets
+                self._tgt_cache[orig_idx] = targets_list
 
         # Apply transforms
         from bernese.data.transforms.base import Sample
 
-        sample = Sample(sequences=seq.unsqueeze(0), targets=targets.unsqueeze(0))
+        # For transforms, we need to stack targets back together temporarily
+        # Stack along a new dimension for transforms
+        num_targets = len(targets_list)
+        targets_stacked = torch.stack(targets_list, dim=0)  # (num_targets, target_length_i)
+
+        sample = Sample(sequences=seq.unsqueeze(0), targets=targets_stacked.unsqueeze(0))
 
         if len(self.transform) > 0:
             sample = self.transform(sample)
@@ -114,13 +124,14 @@ class GenomicDataset(Dataset):
         if len(self.target_transform) > 0:
             sample = self.target_transform(sample)
 
-        return sample.sequences.squeeze(0), sample.targets.squeeze(0)
+        # Return sequence and targets list (unsqueezed)
+        return sample.sequences.squeeze(0), [t.squeeze(0) for t in sample.targets.squeeze(0)]
 
     def get_batch(
         self,
         start: int,
         end: int,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Get a batch of samples efficiently.
 
         Args:
@@ -128,15 +139,16 @@ class GenomicDataset(Dataset):
             end: End index
 
         Returns:
-            Tuple of (sequences, targets) tensors
+            Tuple of (sequences, targets_list) where targets_list is a list of tensors
         """
         indices = list(range(start, end))
 
         # Load all at once (more efficient)
         sequences = self.backend.get_sequences(self.split, indices)
-        targets = self.backend.get_targets(self.split, indices)
+        # get_targets returns list[Tensor], each Tensor shape: (batch, target_length_i)
+        targets_list = self.backend.get_targets(self.split, indices)
 
-        return sequences, targets
+        return sequences, targets_list
 
     def get_coordinates(self, indices: Optional[np.ndarray] = None) -> list[tuple[str, int, int]]:
         """Get genomic coordinates for indices.
@@ -289,7 +301,7 @@ class MultiDatasetWrapper(Dataset):
     def __len__(self) -> int:
         return self.total_len
 
-    def __getitem__(self, idx: int) -> tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> tuple[torch.Tensor, list[torch.Tensor]]:
         """Get sample from wrapped datasets."""
         di = self._index_map[idx % len(self._index_map)]
         local_idx = idx % len(self.datasets[di])

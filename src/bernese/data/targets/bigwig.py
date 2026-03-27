@@ -14,6 +14,9 @@ import h5py
 import numpy as np
 import pysam
 
+import numpy as np
+
+from bernese.data.targets.pool import PoolStat
 from bernese.data.targets.registry import TargetProcessor, TargetProcessorRegistry
 
 
@@ -28,11 +31,11 @@ class BigWigTargetProcessor(TargetProcessor):
     def __init__(
         self,
         pool_width: int = 128,
-        aggregation: str = "mean",
+        pool_stat: PoolStat = PoolStat.MEAN,
         crop_bp: int = 0,
     ):
         self.pool_width = pool_width
-        self.aggregation = aggregation
+        self.pool_stat = pool_stat
         self.crop_bp = crop_bp
 
     @property
@@ -53,6 +56,38 @@ class BigWigTargetProcessor(TargetProcessor):
 
         # Pool
         return seq_length // self.pool_width
+
+    def _aggregate(self, values: np.ndarray, stat: PoolStat | None = None) -> float:
+        """Apply pooling aggregation.
+
+        Args:
+            values: Array of values to aggregate
+            stat: PoolStat to use (defaults to self.pool_stat)
+
+        Returns:
+            Aggregated value
+        """
+        if stat is None:
+            stat = self.pool_stat
+
+        match stat:
+            case PoolStat.SUM:
+                return np.sum(values) if len(values) > 0 else 0.0
+            case PoolStat.SUM_SQRT:
+                return -1 + np.sqrt(1 + np.sum(values)) if len(values) > 0 else 0.0
+            case PoolStat.MEAN:
+                return np.mean(values) if len(values) > 0 else 0.0
+            case PoolStat.MEAN_SQRT:
+                return -1 + np.sqrt(1 + np.mean(values)) if len(values) > 0 else 0.0
+            case PoolStat.MEDIAN:
+                return np.median(values) if len(values) > 0 else 0.0
+            case PoolStat.MAX:
+                return np.max(values) if len(values) > 0 else 0.0
+            case PoolStat.MIN:
+                return np.min(values) if len(values) > 0 else 0.0
+            case PoolStat.PEAK:
+                mean_val = np.mean(values) if len(values) > 0 else 0.0
+                return np.clip(np.sqrt(mean_val * 4), 0, 1)
 
     def process(
         self,
@@ -104,19 +139,7 @@ class BigWigTargetProcessor(TargetProcessor):
                         except:
                             vals = []
 
-                        if len(vals) > 0:
-                            if self.aggregation == "mean":
-                                values.append(np.mean(vals))
-                            elif self.aggregation == "sum":
-                                values.append(np.sum(vals))
-                            elif self.aggregation == "max":
-                                values.append(np.max(vals))
-                            elif self.aggregation == "min":
-                                values.append(np.min(vals))
-                            else:
-                                values.append(np.mean(vals))
-                        else:
-                            values.append(0.0)
+                        values.append(self._aggregate(vals))
 
                     # Pad if needed
                     while len(values) < target_length:

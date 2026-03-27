@@ -25,12 +25,16 @@ class DataWriter(Protocol):
         self,
         split: str,
         coordinates: list[tuple[str, int, int]],
+        targets: list[np.ndarray] | None = None,
+        target_configs: list[Any] | None = None,
     ) -> None:
         """Write genomic coordinates for a split.
 
         Args:
             split: Split name (train/valid/test)
             coordinates: List of (chrom, start, end) tuples
+            targets: List of target arrays, each of shape (num_seqs, target_length_i)
+            target_configs: List of TargetConfig for each target
         """
         ...
 
@@ -68,6 +72,7 @@ class DataWriter(Protocol):
         pool_width: int = 1,
         diagonal_offset: int = 0,
         target_info: list[dict] | None = None,
+        target_lengths: dict[int, int] | None = None,
     ) -> "DatasetMetadata":
         """Finalize dataset by creating manifest.
 
@@ -78,6 +83,7 @@ class DataWriter(Protocol):
             pool_width: Pool width
             diagonal_offset: Diagonal offset
             target_info: List of target info dicts
+            target_lengths: Dictionary mapping target index to target length
 
         Returns:
             DatasetMetadata object
@@ -137,6 +143,7 @@ class DatasetMetadata:
     diagonal_offset: int = 0
     splits: dict[str, SplitMetadata] = field(default_factory=dict)
     targets: list[TargetInfo] = field(default_factory=list)
+    target_lengths: dict[int, int] = field(default_factory=dict)
     statistics: dict[str, Any] = field(default_factory=dict)
 
     @classmethod
@@ -202,15 +209,22 @@ class DatasetMetadata:
 
         # Parse targets
         targets = []
-        if "targets" in data and "info" in data["targets"]:
-            for i, info in enumerate(data["targets"]["info"]):
-                targets.append(
-                    TargetInfo(
-                        name=info.get("name", ""),
-                        clip=info.get("clip"),
-                        index=i,
+        target_lengths = {}
+        if "targets" in data:
+            # Parse target info
+            if "info" in data["targets"]:
+                for i, info in enumerate(data["targets"]["info"]):
+                    targets.append(
+                        TargetInfo(
+                            name=info.get("name", ""),
+                            clip=info.get("clip"),
+                            index=i,
+                        )
                     )
-                )
+            # Parse target_lengths (v3.0+ format)
+            if "lengths" in data["targets"]:
+                for idx, length in data["targets"]["lengths"].items():
+                    target_lengths[int(idx)] = length
 
         return cls(
             version=version,
@@ -226,6 +240,7 @@ class DatasetMetadata:
             diagonal_offset=data.get("targets", {}).get("diagonal_offset", 0),
             splits=splits,
             targets=targets,
+            target_lengths=target_lengths,
             statistics=data.get("statistics", {}),
         )
 
@@ -246,6 +261,7 @@ class DatasetMetadata:
                 "target_length": self.target_length,
                 "pool_width": self.pool_width,
                 "diagonal_offset": self.diagonal_offset,
+                "lengths": self.target_lengths,
                 "info": [],
             },
             "statistics": self.statistics,
@@ -305,15 +321,18 @@ class DataBackend(Protocol):
         self,
         split: str,
         indices: np.ndarray | list[int] | slice | None = None,
-    ) -> torch.Tensor:
+        target_index: int | None = None,
+    ) -> torch.Tensor | list[torch.Tensor]:
         """Load targets for a split.
 
         Args:
             split: Dataset split name (train/valid/test)
             indices: Specific indices to load, or None for all
+            target_index: Specific target index to load, or None for all targets
 
         Returns:
-            Tensor of shape (batch, target_length, num_targets)
+            If target_index is specified: Tensor of shape (batch, target_length)
+            If target_index is None: List of tensors, one per TargetConfig
         """
         ...
 

@@ -74,9 +74,6 @@ def bigwig(
     seq_length: int = typer.Option(131072, "-l", "--seq_length", help="Sequence length in bp"),
     crop_bp: int = typer.Option(0, "-c", "--crop_bp", help="Crop bp from each end"),
     pool_width: int = typer.Option(128, "-w", "--pool_width", help="Pool width for targets"),
-    aggregation: str = typer.Option(
-        "mean", "-a", "--aggregation", help="Aggregation method: mean, sum, max, min"
-    ),
     test_pct: float = typer.Option(0.05, "--test_pct", help="Test set proportion"),
     valid_pct: float = typer.Option(0.05, "--valid_pct", help="Validation set proportion"),
     stride_train: float = typer.Option(
@@ -102,7 +99,6 @@ def bigwig(
         crop_bp=crop_bp,
         pool_width=pool_width,
         target_type="bigwig",
-        aggregation=aggregation,
         diagonal_offset=0,
         test_pct=test_pct,
         valid_pct=valid_pct,
@@ -122,7 +118,6 @@ def _run_preparation(
     pool_width: int,
     target_type: str,
     diagonal_offset: int = 0,
-    aggregation: str = "mean",
     test_pct: float = 0.05,
     valid_pct: float = 0.05,
     stride_train: float = 1.0,

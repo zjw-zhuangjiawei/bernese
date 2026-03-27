@@ -8,17 +8,20 @@ with manifest.json and split-based organization.
 
 from __future__ import annotations
 
+import json
 from collections import namedtuple
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
 import numpy as np
-import pandas as pd
 import pysam
+from pydantic import TypeAdapter
 
 from bernese.data.backends import HDF5Writer
+from bernese.data.config import TargetConfig
 from bernese.data.targets import TargetProcessorRegistry
+from bernese.data.targets.pool import PoolStat
 
 
 # Basenji-style namedtuples
@@ -83,8 +86,11 @@ class DataPreparator:
         self.targets_file = Path(targets_file)
         self.config = config or PreparationConfig()
 
-        # Load targets info
-        self.targets_df = pd.read_csv(targets_file, sep="\t", index_col=0)
+        # Load targets info from JSON
+        with open(targets_file) as f:
+            self.targets_list: list[TargetConfig] = TypeAdapter(
+                list[TargetConfig]
+            ).validate_json(f.read())
 
         # Calculate target length
         self.target_length = self._calculate_target_length()
@@ -95,7 +101,7 @@ class DataPreparator:
             seq_length=self.config.seq_length,
             seq_depth=4,
             target_length=self.target_length,
-            num_targets=len(self.targets_df),
+            num_targets=len(self.targets_list),
         )
 
         # Setup random
@@ -129,13 +135,24 @@ class DataPreparator:
         # Step 3: Finalize (creates manifest.json)
         print("Creating manifest...")
         target_info = []
-        for ti, row in self.targets_df.iterrows():
+        target_lengths: dict[int, int] = {}
+        for i, target in enumerate(self.targets_list):
             target_info.append(
                 {
-                    "name": row.get("name", f"target_{ti}"),
-                    "clip": row.get("clip"),
+                    "name": target.name,
+                    "target_type": target.target_type,
+                    "clip": target.clip,
+                    "metadata": target.metadata,
                 }
             )
+            # Calculate target length for this target
+            # Note: target_length depends on target-specific parameters
+            # We store what was computed during extraction
+
+        # Build target_lengths from writer's understanding
+        # For now, use the same target_length for all (will be updated per-target)
+        for i in range(len(self.targets_list)):
+            target_lengths[i] = self.target_length
 
         metadata = self.writer.finalize(
             genome_name=self.fasta_file.stem,
@@ -143,6 +160,7 @@ class DataPreparator:
             pool_width=self.config.pool_width,
             diagonal_offset=self.config.diagonal_offset,
             target_info=target_info,
+            target_lengths=target_lengths,
         )
 
         print(f"Data preparation complete: {self.output_dir}")
@@ -182,15 +200,10 @@ class DataPreparator:
         # Step 1: Create sequence regions
         regions_by_split = self._create_sequence_regions()
 
-        # Step 2: Get target processor
-        processor = TargetProcessorRegistry.create(
-            self.config.target_type,
-            pool_width=self.config.pool_width,
-            diagonal_offset=self.config.diagonal_offset,
-            crop_bp=self.config.crop_bp,
-        )
+        # Track target_lengths for manifest
+        target_lengths: dict[int, int] = {}
 
-        # Step 3: Process each split atomically
+        # Step 2: Process each split atomically
         for split, regions in regions_by_split.items():
             if len(regions) == 0:
                 continue
@@ -210,20 +223,48 @@ class DataPreparator:
             # Convert regions to tuple format for target processor
             region_tuples = [(r.chrom, r.start, r.end) for r in regions]
 
+            # Collect targets list (each target单独存储)
+            targets_list_write: list[np.ndarray] = []
+
             # Process each target
-            all_targets = []
-            for ti, target_row in self.targets_df.iterrows():
-                target_file = target_row["file"]
+            for i, target in enumerate(self.targets_list):
+                # Build params from target-specific parameters
+                params = dict(target.parameters)
+                params["pool_width"] = self.config.pool_width
+                params["crop_bp"] = self.config.crop_bp
+                if target.target_type == "hic":
+                    params["diagonal_offset"] = self.config.diagonal_offset
+
+                # Extract pool_stat from parameters and convert to enum
+                pool_stat_str = params.pop("pool_stat", "mean")
+                try:
+                    pool_stat = PoolStat(pool_stat_str)
+                except ValueError:
+                    pool_stat = PoolStat.MEAN  # Default to mean
+                params["pool_stat"] = pool_stat
+
+                # Create processor for this target type
+                processor = TargetProcessorRegistry.create(
+                    target.target_type, **params
+                )
 
                 # Process
-                targets = processor.process(target_file, region_tuples)
-                all_targets.append(targets)
+                targets = processor.process(target.file, region_tuples)
 
-            # Stack targets: (num_targets, num_seqs, target_length) -> (num_seqs, target_length, num_targets)
-            targets_stacked = np.stack(all_targets, axis=-1)
+                # Apply clip if specified
+                if target.clip is not None:
+                    targets = np.clip(targets, None, target.clip)
 
-            # Atomic write using write_split (indices + targets in one file)
-            self.writer.write_split(split, chrom_names, starts, ends, targets_stacked)
+                # Store target (num_seqs, target_length_i)
+                targets_list_write.append(targets)
+
+                # Track target length for manifest
+                target_lengths[i] = targets.shape[1]
+
+            # Atomic write using write_split (indices + targets list in one file)
+            self.writer.write_split(
+                split, chrom_names, starts, ends, targets_list_write, self.targets_list
+            )
 
     def _load_genome(self) -> dict[str, int]:
         """Load genome chromosome sizes."""

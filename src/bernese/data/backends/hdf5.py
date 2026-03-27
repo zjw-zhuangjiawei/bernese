@@ -29,6 +29,7 @@ from bernese.data.backends.base import (
     SplitMetadata,
     TargetInfo,
 )
+from bernese.data.config import TargetConfig
 
 
 # Fixed-length string dtype for chromosome names (supports most standard chrom names)
@@ -280,15 +281,18 @@ class HDF5Backend:
         self,
         split: str,
         indices: np.ndarray | list[int] | slice | None = None,
-    ) -> torch.Tensor:
+        target_index: int | None = None,
+    ) -> torch.Tensor | list[torch.Tensor]:
         """Load targets for a split.
 
         Args:
             split: Dataset split name (train/valid/test)
             indices: Specific indices to load, or None for all
+            target_index: Specific target index to load, or None for all targets
 
         Returns:
-            Tensor of shape (batch, target_length, num_targets)
+            If target_index is specified: Tensor of shape (batch, target_length)
+            If target_index is None: List of tensors, one per TargetConfig
         """
         split_info = self._get_split_info(split)
         self._ensure_split_file_open(split)
@@ -301,20 +305,42 @@ class HDF5Backend:
 
         # Read from split file
         with h5py.File(self._split_files[split].filename, "r") as f:
-            if "targets" not in f or "data" not in f["targets"]:
+            if "targets" not in f:
                 if self.strict_mode:
-                    raise KeyError(f"No targets data found in {split_info.split_file}")
+                    raise KeyError(f"No targets found in {split_info.split_file}")
                 num = split_info.num_seqs if indices is None else len(indices)
-                return torch.zeros(num, self._metadata.target_length, self._metadata.num_targets)
+                return [torch.zeros(num, self._metadata.target_length) for _ in range(self._metadata.num_targets)]
 
-            targets_ds = f["targets"]["data"]
+            targets_grp = f["targets"]
 
-            if indices is not None:
-                data = targets_ds[indices]
+            if target_index is not None:
+                # Read specific target: /targets/{target_index}
+                target_path = str(target_index)
+                if target_path not in targets_grp:
+                    raise KeyError(f"Target {target_index} not found in {split}")
+
+                targets_ds = targets_grp[target_path]
+                if indices is not None:
+                    data = targets_ds[indices]
+                else:
+                    data = targets_ds[:]
+                return torch.from_numpy(data.astype(np.float32))
             else:
-                data = targets_ds[:]
+                # Read all targets
+                results = []
+                num_targets = self._metadata.num_targets
+                for i in range(num_targets):
+                    target_path = str(i)
+                    if target_path not in targets_grp:
+                        raise KeyError(f"Target {i} not found in {split}")
 
-        return torch.from_numpy(data.astype(np.float32))
+                    targets_ds = targets_grp[target_path]
+                    if indices is not None:
+                        data = targets_ds[indices]
+                    else:
+                        data = targets_ds[:]
+                    results.append(torch.from_numpy(data.astype(np.float32)))
+                return results
 
     def get_coordinates(
         self,
@@ -418,13 +444,14 @@ class HDF5Writer:
         output_dir: str | Path,
         seq_length: int = 131072,
         seq_depth: int = 4,
-        target_length: int = 0,
+        target_length: int | dict[str, int] = 0,
         num_targets: int = 1,
     ):
         self.output_dir = Path(output_dir)
         self.seq_length = seq_length
         self.seq_depth = seq_depth
-        self.target_length = target_length
+        # Store target_length as dict for multi-type support
+        self._target_length = target_length if isinstance(target_length, dict) else {"default": target_length}
         self.num_targets = num_targets
 
         # Track what has been written
@@ -433,6 +460,18 @@ class HDF5Writer:
 
         # Create directory structure
         self._create_directories()
+
+    @property
+    def target_length(self) -> int | dict[str, int]:
+        """Return target_length (for backward compatibility, returns int if uniform)."""
+        if len(self._target_length) == 1 and "default" in self._target_length:
+            return self._target_length["default"]
+        return self._target_length
+
+    @target_length.setter
+    def target_length(self, value: int | dict[str, int]) -> None:
+        """Set target_length (supports both int and dict formats)."""
+        self._target_length = value if isinstance(value, dict) else {"default": value}
 
     def _create_directories(self) -> None:
         """Create output directory structure."""
@@ -528,7 +567,8 @@ class HDF5Writer:
         chrom_names: list[str],
         starts: list[int],
         ends: list[int],
-        targets: np.ndarray | None = None,
+        targets: list[np.ndarray] | None = None,
+        target_configs: list[TargetConfig] | None = None,
         chunk_size: int = 1024,
     ) -> None:
         """Write indices and targets for a split in a single flat file.
@@ -538,7 +578,8 @@ class HDF5Writer:
             chrom_names: List of chromosome names (e.g., "chr1", "chr2")
             starts: List of start positions
             ends: List of end positions
-            targets: Array of shape (num_seqs, target_length, num_targets), or None
+            targets: List of target arrays, each of shape (num_seqs, target_length_i)
+            target_configs: List of TargetConfig for each target
             chunk_size: HDF5 chunk size for targets
         """
         split_file = self.output_dir / f"{split}.h5"
@@ -566,20 +607,24 @@ class HDF5Writer:
             indices_grp.create_dataset("start", data=np.array(sorted_starts, dtype=np.int32))
             indices_grp.create_dataset("end", data=np.array(sorted_ends, dtype=np.int32))
 
-            # Write targets if provided
-            if sorted_targets is not None:
+            # Write targets if provided (v3.0+ format: /targets/{i} as dataset)
+            if sorted_targets is not None and target_configs is not None:
                 targets_grp = f.create_group("targets")
 
-                # Adapt chunk size to data size
-                actual_chunk_size = min(chunk_size, sorted_targets.shape[0])
+                for i, (target_data, config) in enumerate(zip(sorted_targets, target_configs)):
+                    # Create /targets/{i} dataset directly (not a group)
+                    target_length = target_data.shape[1]
 
-                targets_grp.create_dataset(
-                    "data",
-                    data=sorted_targets.astype(np.float32),
-                    chunks=(actual_chunk_size, self.target_length, self.num_targets),
-                    compression="gzip",
-                    compression_opts=4,
-                )
+                    # Adapt chunk size to data size
+                    actual_chunk_size = min(chunk_size, target_data.shape[0])
+
+                    targets_grp.create_dataset(
+                        str(i),
+                        data=target_data.astype(np.float32),
+                        chunks=(actual_chunk_size, target_length),
+                        compression="gzip",
+                        compression_opts=4,
+                    )
 
         self._splits_written.add(split)
 
@@ -588,7 +633,7 @@ class HDF5Writer:
         chrom_names: list[str],
         starts: list[int],
         ends: list[int],
-        targets: np.ndarray | None = None,
+        targets: list[np.ndarray] | None = None,
     ) -> dict:
         """Sort data by chromosome and start position.
 
@@ -609,7 +654,8 @@ class HDF5Writer:
 
         sorted_targets = None
         if targets is not None:
-            sorted_targets = targets[sorted_idx]
+            # targets is list[np.ndarray], each target_data shape: (num_seqs, target_length_i)
+            sorted_targets = [target_data[sorted_idx] for target_data in targets]
 
         return {
             "chroms": sorted_chroms,
@@ -622,14 +668,16 @@ class HDF5Writer:
         self,
         split: str,
         coordinates: list[tuple[str, int, int]],
-        targets: np.ndarray | None = None,
+        targets: list[np.ndarray] | None = None,
+        target_configs: list[TargetConfig] | None = None,
     ) -> None:
         """Write genomic coordinates and targets for a split.
 
         Args:
             split: Split name (train/valid/test)
             coordinates: List of (chrom, start, end) tuples
-            targets: Optional target array
+            targets: List of target arrays, each of shape (num_seqs, target_length_i)
+            target_configs: List of TargetConfig for each target
         """
         chrom_names = []
         starts = []
@@ -640,7 +688,7 @@ class HDF5Writer:
             starts.append(start)
             ends.append(end)
 
-        self.write_split(split, chrom_names, starts, ends, targets)
+        self.write_split(split, chrom_names, starts, ends, targets, target_configs)
 
     def finalize(
         self,
@@ -649,6 +697,7 @@ class HDF5Writer:
         pool_width: int = 1,
         diagonal_offset: int = 0,
         target_info: list[dict] | None = None,
+        target_lengths: dict[int, int] | None = None,
     ) -> DatasetMetadata:
         """Finalize dataset by creating manifest.json.
 
@@ -658,6 +707,7 @@ class HDF5Writer:
             pool_width: Pool width
             diagonal_offset: Diagonal offset
             target_info: List of target info dicts
+            target_lengths: Dictionary mapping target index to target length
 
         Returns:
             DatasetMetadata object
@@ -696,7 +746,7 @@ class HDF5Writer:
 
         # Create metadata
         metadata = DatasetMetadata(
-            version="2.0",
+            version="3.0",
             name=self.output_dir.name,
             created=datetime.utcnow().isoformat() + "Z",
             genome=GenomeInfo(name=genome_name),
@@ -709,6 +759,7 @@ class HDF5Writer:
             diagonal_offset=diagonal_offset,
             splits=splits,
             targets=targets,
+            target_lengths=target_lengths or {},
         )
 
         # Write manifest

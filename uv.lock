@@ -118,9 +118,7 @@ cu130 = [
     { name = "torch", version = "2.10.0", source = { registry = "https://mirrors.ustc.edu.cn/pypi/simple" }, marker = "sys_platform != 'linux' and sys_platform != 'win32'" },
     { name = "torch", version = "2.10.0+cu130", source = { registry = "https://download.pytorch.org/whl/cu130" }, marker = "sys_platform == 'linux' or sys_platform == 'win32'" },
 ]
-
-[package.dev-dependencies]
-dev = [
+ipykernel = [
     { name = "ipykernel" },
 ]
 
@@ -132,6 +130,7 @@ requires-dist = [
     { name = "einops", specifier = ">=0.8.2" },
     { name = "h5py" },
     { name = "intervaltree", specifier = ">=3.2.1" },
+    { name = "ipykernel", marker = "extra == 'ipykernel'", specifier = ">=7" },
     { name = "keras", specifier = ">=3.13.2" },
     { name = "numpy" },
     { name = "pandas" },
@@ -144,10 +143,7 @@ requires-dist = [
     { name = "torchinfo", specifier = ">=1.8.0" },
     { name = "typer", specifier = ">=0.24.1" },
 ]
-provides-extras = ["cu130"]
-
-[package.metadata.requires-dev]
-dev = [{ name = "ipykernel", specifier = ">=7.2.0" }]
+provides-extras = ["cu130", "ipykernel"]
 
 [[package]]
 name = "bioframe"

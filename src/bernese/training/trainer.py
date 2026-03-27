@@ -443,6 +443,17 @@ class Trainer:
         print("Training complete!")
         return self.history
 
+    def _prepare_targets(self, targets_list: list[torch.Tensor]) -> torch.Tensor:
+        """Flatten and concatenate targets list into a single tensor.
+
+        Args:
+            targets_list: List of target tensors, each of shape (batch, target_length_i)
+
+        Returns:
+            Concatenated tensor of shape (batch, total_target_length)
+        """
+        return torch.cat(targets_list, dim=-1)
+
     def _train_epoch(self) -> float:
         """Train for one epoch.
 
@@ -467,12 +478,13 @@ class Trainer:
                 for it in iterators:
                     try:
                         batch = next(it)
-                        sequences, targets = batch
+                        sequences, targets_list = batch
                         has_data = True
 
                         # Convert to numpy
                         X = sequences.numpy().astype("float32")
-                        y = targets.numpy().astype("float32")
+                        # Prepare targets: concatenate list of tensors
+                        y = self._prepare_targets(targets_list).numpy().astype("float32")
 
                         # Forward pass via Keras train_on_batch
                         loss = self.model.model.train_on_batch(X, y)
@@ -487,11 +499,12 @@ class Trainer:
         else:
             # Single dataset
             for batch in loaders[0]:
-                sequences, targets = batch
+                sequences, targets_list = batch
 
                 # Convert to numpy
                 X = sequences.numpy().astype("float32")
-                y = targets.numpy().astype("float32")
+                # Prepare targets: concatenate list of tensors
+                y = self._prepare_targets(targets_list).numpy().astype("float32")
 
                 # Forward pass via Keras train_on_batch
                 loss = self.model.model.train_on_batch(X, y)
@@ -526,11 +539,12 @@ class Trainer:
 
         for loader in loaders:
             for batch in loader:
-                sequences, targets = batch
+                sequences, targets_list = batch
 
                 # Convert to numpy
                 X = sequences.numpy().astype("float32")
-                y = targets.numpy().astype("float32")
+                # Prepare targets: concatenate list of tensors
+                y = self._prepare_targets(targets_list).numpy().astype("float32")
 
                 # Predict
                 preds = self.model.model.predict(X, verbose=0)
